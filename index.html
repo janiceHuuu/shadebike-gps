@@ -174,15 +174,22 @@
     }
 
     function sendCommandToESP32(action) {
-      const url =
-        "http://" + esp32IP +
-        "/cmd?dir=" + action +
-        "&silent=1";
+      const serverUrl =
+        "https://backside-stalemate-impending.ngrok-free.dev/set?dir=" + action;
     
       document.getElementById("status").innerHTML =
-        "<span class='trigger'>Sending to ESP32: " + action + "</span>";
+        "<span class='trigger'>Sending command to server: " + action + "</span>";
     
-      window.location.href = url;
+      fetch(serverUrl)
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById("status").innerHTML =
+            "<span class='trigger'>Command sent to server: " + action + "</span>";
+        })
+        .catch(error => {
+          document.getElementById("status").innerHTML =
+            "Failed to send command to server.";
+        });
     }
 
     function resetTrigger() {
