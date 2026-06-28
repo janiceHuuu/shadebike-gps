@@ -50,6 +50,14 @@
       margin-top: 14px;
     }
 
+    .test-btn {
+      background: #e67e22;
+    }
+
+    .reset-btn {
+      background: #7f8c8d;
+    }
+
     .status {
       font-size: 20px;
       color: #333;
@@ -68,6 +76,8 @@
   <h1>ShadeBike GPS Navigation Test</h1>
 
   <button onclick="startGPS()">Start GPS</button>
+  <button class="test-btn" onclick="sendCommandToESP32(targetAction)">Test Send R to ESP32</button>
+  <button class="reset-btn" onclick="resetTrigger()">Reset Trigger</button>
 
   <div class="card">
     <div class="label">Current Latitude</div>
@@ -94,7 +104,13 @@
   <div class="status" id="status">Press Start GPS</div>
 
   <script>
-    // ===== 測試導航點：請改成你目前附近的座標 =====
+    // ===== ESP32 設定 =====
+    const esp32IP = "172.20.10.2";
+
+    // ===== 你的 GitHub Pages 網址 =====
+    const backUrl = "https://janicehuuu.github.io/shadebike-gps/";
+
+    // ===== 測試導航點：目前設定成你剛剛提供的座標 =====
     const targetLat = 22.99876019;
     const targetLon = 120.21985536;
     const targetAction = "R";
@@ -123,14 +139,17 @@
           document.getElementById("lon").innerHTML = lon.toFixed(8);
           document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
           document.getElementById("dist").innerHTML = d.toFixed(1) + " m";
+          document.getElementById("action").innerHTML = targetAction;
 
           if (d <= triggerDistance && !hasTriggered) {
             hasTriggered = true;
-          
+
             document.getElementById("status").innerHTML =
               "<span class='trigger'>Trigger: " + targetAction + "</span>";
-          
-            sendCommandToESP32(targetAction);
+
+            setTimeout(function() {
+              sendCommandToESP32(targetAction);
+            }, 500);
           }
           else if (!hasTriggered) {
             document.getElementById("status").innerHTML = "GPS updated";
@@ -154,6 +173,23 @@
       );
     }
 
+    function sendCommandToESP32(action) {
+      const url =
+        "http://" + esp32IP +
+        "/cmd?dir=" + action +
+        "&back=" + encodeURIComponent(backUrl);
+
+      document.getElementById("status").innerHTML =
+        "<span class='trigger'>Redirecting to ESP32: " + action + "</span>";
+
+      window.location.href = url;
+    }
+
+    function resetTrigger() {
+      hasTriggered = false;
+      document.getElementById("status").innerHTML = "Trigger reset. Press Start GPS again if needed.";
+    }
+
     function distanceMeters(lat1, lon1, lat2, lon2) {
       const R = 6371000;
       const phi1 = lat1 * Math.PI / 180;
@@ -169,21 +205,6 @@
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
       return R * c;
-    }
-    function sendCommandToESP32(action) {
-      const esp32IP = "172.20.10.2";
-      const url = "http://" + esp32IP + "/cmd?dir=" + action + "&t=" + Date.now();
-    
-      document.getElementById("status").innerHTML =
-        "<span class='trigger'>Sending to ESP32: " + action + "</span>";
-    
-      const img = new Image();
-      img.src = url;
-    
-      setTimeout(function() {
-        document.getElementById("status").innerHTML =
-          "<span class='trigger'>Command sent attempt: " + action + "</span>";
-      }, 500);
     }
   </script>
 </body>
