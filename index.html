@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ShadeBike GPS Test</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+      text-align: center;
+      background: #f4f4f4;
+    }
+
+    h1 {
+      font-size: 30px;
+    }
+
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: 20px;
+      margin: 16px auto;
+      max-width: 420px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+    }
+
+    .label {
+      font-size: 16px;
+      color: #666;
+      margin-top: 12px;
+    }
+
+    .value {
+      font-size: 24px;
+      font-weight: bold;
+      word-break: break-all;
+    }
+
+    button {
+      width: 90%;
+      max-width: 420px;
+      padding: 18px;
+      font-size: 24px;
+      border: none;
+      border-radius: 16px;
+      color: white;
+      background: #2980b9;
+      margin-top: 16px;
+    }
+
+    .status {
+      font-size: 18px;
+      color: #333;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>ShadeBike GPS Test</h1>
+
+  <button onclick="startGPS()">Start GPS</button>
+
+  <div class="card">
+    <div class="label">Latitude</div>
+    <div class="value" id="lat">--</div>
+
+    <div class="label">Longitude</div>
+    <div class="value" id="lon">--</div>
+
+    <div class="label">Accuracy</div>
+    <div class="value" id="acc">--</div>
+  </div>
+
+  <div class="status" id="status">Press Start GPS</div>
+
+  <script>
+    let watchId = null;
+
+    function startGPS() {
+      if (!navigator.geolocation) {
+        document.getElementById("status").innerHTML = "This browser does not support GPS.";
+        return;
+      }
+
+      document.getElementById("status").innerHTML = "Requesting GPS permission...";
+
+      watchId = navigator.geolocation.watchPosition(
+        function(position) {
+          const lat = position.coords.latitude;
+          const lon = position.coords.longitude;
+          const acc = position.coords.accuracy;
+
+          document.getElementById("lat").innerHTML = lat.toFixed(8);
+          document.getElementById("lon").innerHTML = lon.toFixed(8);
+          document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
+          document.getElementById("status").innerHTML = "GPS updated";
+        },
+        function(error) {
+          let msg = "";
+
+          if (error.code === 1) msg = "Permission denied. Please allow location access.";
+          else if (error.code === 2) msg = "Position unavailable.";
+          else if (error.code === 3) msg = "GPS timeout.";
+          else msg = "Unknown GPS error.";
+
+          document.getElementById("status").innerHTML = msg;
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 0
+        }
+      );
+    }
+  </script>
+</body>
+</html>
