@@ -177,11 +177,11 @@
       const url =
         "http://" + esp32IP +
         "/cmd?dir=" + action +
-        "&back=" + encodeURIComponent(backUrl);
-
+        "&silent=1";
+    
       document.getElementById("status").innerHTML =
-        "<span class='trigger'>Redirecting to ESP32: " + action + "</span>";
-
+        "<span class='trigger'>Sending to ESP32: " + action + "</span>";
+    
       window.location.href = url;
     }
 
