@@ -126,9 +126,13 @@
 
           if (d <= triggerDistance && !hasTriggered) {
             hasTriggered = true;
+          
             document.getElementById("status").innerHTML =
               "<span class='trigger'>Trigger: " + targetAction + "</span>";
-          } else if (!hasTriggered) {
+          
+            sendCommandToESP32(targetAction);
+          }
+          else if (!hasTriggered) {
             document.getElementById("status").innerHTML = "GPS updated";
           }
         },
@@ -165,6 +169,24 @@
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
       return R * c;
+    }
+    function sendCommandToESP32(action) {
+      const esp32IP = "172.20.10.2";
+      const url = "http://" + esp32IP + "/cmd?dir=" + action;
+    
+      document.getElementById("status").innerHTML =
+        "Sending command to ESP32: " + action;
+    
+      fetch(url)
+        .then(response => response.text())
+        .then(data => {
+          document.getElementById("status").innerHTML =
+            "<span class='trigger'>ESP32 replied: " + data + "</span>";
+        })
+        .catch(error => {
+          document.getElementById("status").innerHTML =
+            "Failed to send command to ESP32. Browser may block HTTP request.";
+        });
     }
   </script>
 </body>
