@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ShadeBike GPS Test</title>
+  <title>ShadeBike GPS Navigation Test</title>
 
   <style>
     body {
@@ -14,7 +14,7 @@
     }
 
     h1 {
-      font-size: 30px;
+      font-size: 28px;
     }
 
     .card {
@@ -22,7 +22,7 @@
       border-radius: 16px;
       padding: 20px;
       margin: 16px auto;
-      max-width: 420px;
+      max-width: 430px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.12);
     }
 
@@ -33,51 +33,75 @@
     }
 
     .value {
-      font-size: 24px;
+      font-size: 23px;
       font-weight: bold;
       word-break: break-all;
     }
 
     button {
       width: 90%;
-      max-width: 420px;
+      max-width: 430px;
       padding: 18px;
-      font-size: 24px;
+      font-size: 23px;
       border: none;
       border-radius: 16px;
       color: white;
       background: #2980b9;
-      margin-top: 16px;
+      margin-top: 14px;
     }
 
     .status {
-      font-size: 18px;
+      font-size: 20px;
       color: #333;
       margin-top: 20px;
+      font-weight: bold;
+    }
+
+    .trigger {
+      color: #c0392b;
+      font-size: 24px;
     }
   </style>
 </head>
 
 <body>
-  <h1>ShadeBike GPS Test</h1>
+  <h1>ShadeBike GPS Navigation Test</h1>
 
   <button onclick="startGPS()">Start GPS</button>
 
   <div class="card">
-    <div class="label">Latitude</div>
+    <div class="label">Current Latitude</div>
     <div class="value" id="lat">--</div>
 
-    <div class="label">Longitude</div>
+    <div class="label">Current Longitude</div>
     <div class="value" id="lon">--</div>
 
     <div class="label">Accuracy</div>
     <div class="value" id="acc">--</div>
+
+    <div class="label">Distance to Next Point</div>
+    <div class="value" id="dist">--</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Next Action</div>
+    <div class="value" id="action">R</div>
+
+    <div class="label">Trigger Radius</div>
+    <div class="value">10 m</div>
   </div>
 
   <div class="status" id="status">Press Start GPS</div>
 
   <script>
+    // ===== 測試導航點：請改成你目前附近的座標 =====
+    const targetLat = 22.99876019;
+    const targetLon = 120.21985536;
+    const targetAction = "R";
+    const triggerDistance = 10; // 公尺
+
     let watchId = null;
+    let hasTriggered = false;
 
     function startGPS() {
       if (!navigator.geolocation) {
@@ -93,10 +117,20 @@
           const lon = position.coords.longitude;
           const acc = position.coords.accuracy;
 
+          const d = distanceMeters(lat, lon, targetLat, targetLon);
+
           document.getElementById("lat").innerHTML = lat.toFixed(8);
           document.getElementById("lon").innerHTML = lon.toFixed(8);
           document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
-          document.getElementById("status").innerHTML = "GPS updated";
+          document.getElementById("dist").innerHTML = d.toFixed(1) + " m";
+
+          if (d <= triggerDistance && !hasTriggered) {
+            hasTriggered = true;
+            document.getElementById("status").innerHTML =
+              "<span class='trigger'>Trigger: " + targetAction + "</span>";
+          } else if (!hasTriggered) {
+            document.getElementById("status").innerHTML = "GPS updated";
+          }
         },
         function(error) {
           let msg = "";
@@ -114,6 +148,23 @@
           maximumAge: 0
         }
       );
+    }
+
+    function distanceMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const phi1 = lat1 * Math.PI / 180;
+      const phi2 = lat2 * Math.PI / 180;
+      const dPhi = (lat2 - lat1) * Math.PI / 180;
+      const dLambda = (lon2 - lon1) * Math.PI / 180;
+
+      const a =
+        Math.sin(dPhi / 2) * Math.sin(dPhi / 2) +
+        Math.cos(phi1) * Math.cos(phi2) *
+        Math.sin(dLambda / 2) * Math.sin(dLambda / 2);
+
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+      return R * c;
     }
   </script>
 </body>
