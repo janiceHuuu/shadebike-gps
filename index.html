@@ -172,21 +172,18 @@
     }
     function sendCommandToESP32(action) {
       const esp32IP = "172.20.10.2";
-      const url = "http://" + esp32IP + "/cmd?dir=" + action;
+      const url = "http://" + esp32IP + "/cmd?dir=" + action + "&t=" + Date.now();
     
       document.getElementById("status").innerHTML =
-        "Sending command to ESP32: " + action;
+        "<span class='trigger'>Sending to ESP32: " + action + "</span>";
     
-      fetch(url)
-        .then(response => response.text())
-        .then(data => {
-          document.getElementById("status").innerHTML =
-            "<span class='trigger'>ESP32 replied: " + data + "</span>";
-        })
-        .catch(error => {
-          document.getElementById("status").innerHTML =
-            "Failed to send command to ESP32. Browser may block HTTP request.";
-        });
+      const img = new Image();
+      img.src = url;
+    
+      setTimeout(function() {
+        document.getElementById("status").innerHTML =
+          "<span class='trigger'>Command sent attempt: " + action + "</span>";
+      }, 500);
     }
   </script>
 </body>
