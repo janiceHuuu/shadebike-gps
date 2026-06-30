@@ -522,41 +522,36 @@
       if (map === null || routePoints.length === 0) {
         return;
       }
-
-      let networkLatLngs = [];
-
-      if (routeGeometry && routeGeometry.length > 0) {
-        networkLatLngs = routeGeometry;
-      } else {
-        networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
-      }
-
+    
+      // 先用 routePoints 畫線，確保線一定會經過所有節點，也一定會接到 S/E
+      const networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
+    
       if (networkLatLngs.length === 0) {
         return;
       }
-
+    
       routeLine = L.polyline(networkLatLngs, {
         color: "#2e86ff",
         weight: 6,
         opacity: 0.85
       }).addTo(map);
-
+    
       drawSnapMarkers();
       drawConnectorLines();
       drawRouteNodeMarkers();
-
+    
       updateNextMarker();
-
+    
       const bounds = L.latLngBounds(networkLatLngs);
-
+    
       if (currentMarker !== null) {
         bounds.extend(currentMarker.getLatLng());
       }
-
+    
       if (destMarker !== null) {
         bounds.extend(destMarker.getLatLng());
       }
-
+    
       map.fitBounds(bounds, {
         padding: [30, 30]
       });
