@@ -98,6 +98,14 @@
       line-height: 1.5;
     }
 
+    .ok-text {
+      color: #27ae60;
+    }
+
+    .danger-text {
+      color: #c0392b;
+    }
+
     #map {
       width: 100%;
       max-width: 430px;
@@ -170,6 +178,7 @@
   <button class="test-btn" onclick="sendCommandToESP32('R')">Test Send R to ESP32</button>
   <button class="test-btn" onclick="sendCommandToESP32('L')">Test Send L to ESP32</button>
   <button class="test-btn" onclick="sendCommandToESP32('A')">Test Send A to ESP32</button>
+  <button class="test-btn" onclick="sendCommandToESP32('X')">Test Send X to ESP32</button>
 
   <button class="reset-btn" onclick="resetRoute()">Reset Route</button>
   <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
@@ -217,6 +226,18 @@
   </div>
 
   <div class="card">
+    <div class="label">Distance from Route</div>
+    <div class="value" id="routeDistance">-- m</div>
+
+    <div class="label">Off-route Status</div>
+    <div class="value" id="offRouteStatus">No route yet</div>
+
+    <div class="hint">
+      超過 50 m 會送 X；回到 30 m 內會送 S。
+    </div>
+  </div>
+
+  <div class="card">
     <div class="label">Command Status</div>
     <div class="value" id="commandStatus">No command sent yet</div>
   </div>
@@ -227,6 +248,10 @@
     const SERVER_BASE_URL = "https://shadebike-server.onrender.com";
 
     const TRIGGER_DISTANCE = 25;
+
+    // 偏離路線判斷門檻
+    const OFF_ROUTE_DISTANCE = 50;
+    const BACK_ON_ROUTE_DISTANCE = 30;
 
     const DEFAULT_CENTER_LAT = 23.0015;
     const DEFAULT_CENTER_LON = 120.2190;
@@ -252,6 +277,10 @@
     let routeLoaded = false;
     let routeRequesting = false;
     let lastSentIndex = -1;
+
+    // 偏離路線狀態
+    let isOffRoute = false;
+    let lastOffRouteDistance = null;
 
     let map = null;
 
@@ -418,7 +447,12 @@
       }
 
       if (routeLoaded) {
-        checkRouteProgress(lat, lon);
+        checkOffRoute(lat, lon);
+
+        // 偏離路線時，先不要繼續觸發一般導航點 L/R/S/A
+        if (!isOffRoute) {
+          checkRouteProgress(lat, lon);
+        }
       }
     }
 
@@ -507,6 +541,9 @@
           lastSentIndex = -1;
           routeLoaded = true;
 
+          isOffRoute = false;
+          lastOffRouteDistance = null;
+
           const startSnapText = startSnap
             ? "<br>Start snap: " + Number(startSnap.distance_m).toFixed(1) + " m"
             : "";
@@ -527,8 +564,17 @@
           document.getElementById("status").innerHTML =
             data.time_slot + " route loaded. Start navigation.";
 
+          document.getElementById("offRouteStatus").innerHTML =
+            "<span class='ok-text'>On route</span>";
+
+          document.getElementById("routeDistance").innerHTML =
+            "-- m";
+
           drawRouteOnMap();
           updateNextPointDisplay();
+
+          // 路徑規劃成功後，通知 ESP32 開始導航，顯示綠燈
+          sendCommandToESP32("S");
         })
         .catch(error => {
           routeRequesting = false;
@@ -580,20 +626,11 @@
         return;
       }
 
-      // 藍色實線：真正沿道路 geometry 的路線
       routeLine = L.polyline(roadLatLngs, {
         color: "#2e86ff",
         weight: 6,
         opacity: 0.85
       }).addTo(map);
-
-      // 灰色虛線：節點連線，用來檢查路徑節點順序
-      /*nodePathLine = L.polyline(nodeLatLngs, {
-        color: "#555555",
-        weight: 3,
-        opacity: 0.65,
-        dashArray: "6,8"
-      }).addTo(map);*/
 
       drawSnapMarkers();
       drawConnectorLines();
@@ -853,6 +890,12 @@
       document.getElementById("action").innerHTML =
         "--";
 
+      document.getElementById("offRouteStatus").innerHTML =
+        "Finished";
+
+      document.getElementById("routeDistance").innerHTML =
+        "-- m";
+
       if (nextMarker !== null && map !== null) {
         map.removeLayer(nextMarker);
         nextMarker = null;
@@ -871,6 +914,9 @@
       routeRequesting = false;
       lastSentIndex = -1;
 
+      isOffRoute = false;
+      lastOffRouteDistance = null;
+
       clearRouteDrawing();
 
       document.getElementById("routeStatus").innerHTML =
@@ -884,6 +930,12 @@
 
       document.getElementById("action").innerHTML =
         "--";
+
+      document.getElementById("routeDistance").innerHTML =
+        "-- m";
+
+      document.getElementById("offRouteStatus").innerHTML =
+        "No route yet";
     }
 
     function resetRoute() {
@@ -984,6 +1036,136 @@
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
       return R * c;
+    }
+
+    // =========================
+    // 偏離路線距離計算
+    // =========================
+
+    function latLonToLocalXY(lat, lon, lat0, lon0) {
+      const R = 6371000;
+
+      const x =
+        (lon - lon0) * Math.PI / 180 *
+        R * Math.cos(lat0 * Math.PI / 180);
+
+      const y =
+        (lat - lat0) * Math.PI / 180 *
+        R;
+
+      return { x, y };
+    }
+
+    function distancePointToSegmentMeters(pLat, pLon, aLat, aLon, bLat, bLon) {
+      const p = latLonToLocalXY(pLat, pLon, pLat, pLon);
+      const a = latLonToLocalXY(aLat, aLon, pLat, pLon);
+      const b = latLonToLocalXY(bLat, bLon, pLat, pLon);
+
+      const abx = b.x - a.x;
+      const aby = b.y - a.y;
+
+      const apx = p.x - a.x;
+      const apy = p.y - a.y;
+
+      const abLen2 = abx * abx + aby * aby;
+
+      if (abLen2 === 0) {
+        return Math.sqrt(apx * apx + apy * apy);
+      }
+
+      let t = (apx * abx + apy * aby) / abLen2;
+      t = Math.max(0, Math.min(1, t));
+
+      const qx = a.x + t * abx;
+      const qy = a.y + t * aby;
+
+      const dx = p.x - qx;
+      const dy = p.y - qy;
+
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    function distanceToRouteGeometryMeters(currentLat, currentLon) {
+      let geometry = [];
+
+      if (routeGeometry && routeGeometry.length >= 2) {
+        geometry = routeGeometry;
+      } else if (routePoints && routePoints.length >= 2) {
+        geometry = routePoints.map(p => [p.lat, p.lon]);
+      } else {
+        return null;
+      }
+
+      let minDistance = Infinity;
+
+      for (let i = 0; i < geometry.length - 1; i++) {
+        const a = geometry[i];
+        const b = geometry[i + 1];
+
+        const d = distancePointToSegmentMeters(
+          currentLat,
+          currentLon,
+          a[0],
+          a[1],
+          b[0],
+          b[1]
+        );
+
+        if (d < minDistance) {
+          minDistance = d;
+        }
+      }
+
+      return minDistance;
+    }
+
+    function checkOffRoute(currentLat, currentLon) {
+      const distance = distanceToRouteGeometryMeters(currentLat, currentLon);
+
+      if (distance === null) {
+        document.getElementById("routeDistance").innerHTML = "-- m";
+        document.getElementById("offRouteStatus").innerHTML = "No route";
+        return;
+      }
+
+      lastOffRouteDistance = distance;
+
+      document.getElementById("routeDistance").innerHTML =
+        distance.toFixed(1) + " m";
+
+      if (!isOffRoute && distance > OFF_ROUTE_DISTANCE) {
+        isOffRoute = true;
+
+        document.getElementById("offRouteStatus").innerHTML =
+          "<span class='danger-text'>OFF ROUTE</span>";
+
+        document.getElementById("status").innerHTML =
+          "<span class='trigger'>Off route: " + distance.toFixed(1) + " m</span>";
+
+        sendCommandToESP32("X");
+        return;
+      }
+
+      if (isOffRoute && distance < BACK_ON_ROUTE_DISTANCE) {
+        isOffRoute = false;
+
+        document.getElementById("offRouteStatus").innerHTML =
+          "<span class='ok-text'>Back on route</span>";
+
+        document.getElementById("status").innerHTML =
+          "Back on route. Continue navigation.";
+
+        sendCommandToESP32("S");
+        return;
+      }
+
+      if (isOffRoute) {
+        document.getElementById("offRouteStatus").innerHTML =
+          "<span class='danger-text'>OFF ROUTE</span>";
+      } else {
+        document.getElementById("offRouteStatus").innerHTML =
+          "<span class='ok-text'>On route</span>";
+      }
     }
   </script>
 </body>
