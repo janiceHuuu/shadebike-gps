@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ShadeBike GPS Navigation Test</title>
+  <title>ShadeBike GPS Navigation</title>
 
   <style>
     body {
@@ -33,7 +33,7 @@
     }
 
     .value {
-      font-size: 23px;
+      font-size: 22px;
       font-weight: bold;
       word-break: break-all;
     }
@@ -42,12 +42,13 @@
       width: 90%;
       max-width: 430px;
       padding: 18px;
-      font-size: 23px;
+      font-size: 22px;
       border: none;
       border-radius: 16px;
       color: white;
       background: #2980b9;
       margin-top: 14px;
+      cursor: pointer;
     }
 
     .test-btn {
@@ -56,6 +57,10 @@
 
     .reset-btn {
       background: #7f8c8d;
+    }
+
+    .stop-btn {
+      background: #c0392b;
     }
 
     .status {
@@ -68,16 +73,26 @@
     .trigger {
       color: #c0392b;
       font-size: 24px;
+      font-weight: bold;
+    }
+
+    .small {
+      font-size: 15px;
+      color: #666;
+      line-height: 1.5;
     }
   </style>
 </head>
 
 <body>
-  <h1>ShadeBike GPS Navigation Test</h1>
+  <h1>ShadeBike GPS Navigation</h1>
 
-  <button onclick="startGPS()">Start GPS</button>
-  <button class="test-btn" onclick="sendCommandToESP32(targetAction)">Test Send R to ESP32</button>
-  <button class="reset-btn" onclick="resetTrigger()">Reset Trigger</button>
+  <button onclick="startGPS()">Start GPS and Request Route</button>
+  <button class="test-btn" onclick="sendCommandToESP32('R')">Test Send R to ESP32</button>
+  <button class="test-btn" onclick="sendCommandToESP32('L')">Test Send L to ESP32</button>
+  <button class="test-btn" onclick="sendCommandToESP32('A')">Test Send A to ESP32</button>
+  <button class="reset-btn" onclick="resetRoute()">Reset Route</button>
+  <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
 
   <div class="card">
     <div class="label">Current Latitude</div>
@@ -88,83 +103,76 @@
 
     <div class="label">Accuracy</div>
     <div class="value" id="acc">--</div>
-
-    <div class="label">Distance to Next Point</div>
-    <div class="value" id="dist">--</div>
   </div>
 
   <div class="card">
-    <div class="label">Next Action</div>
-    <div class="value" id="action">R</div>
+    <div class="label">Destination</div>
+    <div class="value" id="dest">23.0015, 120.2190</div>
 
     <div class="label">Trigger Radius</div>
-    <div class="value">10 m</div>
+    <div class="value" id="radius">10 m</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Route Status</div>
+    <div class="value" id="routeStatus">No route yet</div>
+
+    <div class="label">Next Navigation Point</div>
+    <div class="value" id="nextPoint">--</div>
+
+    <div class="label">Distance to Next Point</div>
+    <div class="value" id="dist">--</div>
+
+    <div class="label">Next Action</div>
+    <div class="value" id="action">--</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Command Status</div>
+    <div class="value" id="commandStatus">No command sent yet</div>
   </div>
 
   <div class="status" id="status">Press Start GPS</div>
 
   <script>
-    // ===== ESP32 設定 =====
-    const esp32IP = "172.20.10.2";
+    // ===== Render 後端網址 =====
+    const SERVER_BASE_URL = "https://shadebike-server.onrender.com";
 
-    // ===== 你的 GitHub Pages 網址 =====
-    const backUrl = "https://janicehuuu.github.io/shadebike-gps/";
+    // ===== 固定目的地，先用你剛剛測 /route 成功的目的地 =====
+    const DEST_LAT = 23.0015;
+    const DEST_LON = 120.2190;
 
-    // ===== 測試導航點：目前設定成你剛剛提供的座標 =====
-    const targetLat = 22.99876019;
-    const targetLon = 120.21985536;
-    const targetAction = "R";
-    const triggerDistance = 10; // 公尺
+    // ===== 導航觸發距離 =====
+    const TRIGGER_DISTANCE = 10; // 公尺
 
+    // ===== GPS / route 狀態 =====
     let watchId = null;
-    let hasTriggered = false;
+
+    let routePoints = [];
+    let currentRouteIndex = 0;
+    let routeLoaded = false;
+    let routeRequesting = false;
+    let lastSentIndex = -1;
 
     function startGPS() {
       if (!navigator.geolocation) {
-        document.getElementById("status").innerHTML = "This browser does not support GPS.";
+        document.getElementById("status").innerHTML =
+          "This browser does not support GPS.";
         return;
       }
 
-      document.getElementById("status").innerHTML = "Requesting GPS permission...";
+      if (watchId !== null) {
+        document.getElementById("status").innerHTML =
+          "GPS is already running.";
+        return;
+      }
+
+      document.getElementById("status").innerHTML =
+        "Requesting GPS permission...";
 
       watchId = navigator.geolocation.watchPosition(
-        function(position) {
-          const lat = position.coords.latitude;
-          const lon = position.coords.longitude;
-          const acc = position.coords.accuracy;
-
-          const d = distanceMeters(lat, lon, targetLat, targetLon);
-
-          document.getElementById("lat").innerHTML = lat.toFixed(8);
-          document.getElementById("lon").innerHTML = lon.toFixed(8);
-          document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
-          document.getElementById("dist").innerHTML = d.toFixed(1) + " m";
-          document.getElementById("action").innerHTML = targetAction;
-
-          if (d <= triggerDistance && !hasTriggered) {
-            hasTriggered = true;
-
-            document.getElementById("status").innerHTML =
-              "<span class='trigger'>Trigger: " + targetAction + "</span>";
-
-            setTimeout(function() {
-              sendCommandToESP32(targetAction);
-            }, 500);
-          }
-          else if (!hasTriggered) {
-            document.getElementById("status").innerHTML = "GPS updated";
-          }
-        },
-        function(error) {
-          let msg = "";
-
-          if (error.code === 1) msg = "Permission denied. Please allow location access.";
-          else if (error.code === 2) msg = "Position unavailable.";
-          else if (error.code === 3) msg = "GPS timeout.";
-          else msg = "Unknown GPS error.";
-
-          document.getElementById("status").innerHTML = msg;
-        },
+        handlePosition,
+        handleGPSError,
         {
           enableHighAccuracy: true,
           timeout: 10000,
@@ -173,34 +181,259 @@
       );
     }
 
-    function sendCommandToESP32(action) {
-      const serverUrl =
-        "https://shadebike-server.onrender.com/set?dir=" + action;
-    
+    function handlePosition(position) {
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+      const acc = position.coords.accuracy;
+
+      document.getElementById("lat").innerHTML = lat.toFixed(8);
+      document.getElementById("lon").innerHTML = lon.toFixed(8);
+      document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
+
+      // 第一次取得 GPS 後，向 Render 要路徑
+      if (!routeLoaded && !routeRequesting) {
+        requestRoute(lat, lon);
+        return;
+      }
+
+      // 路徑載入後，持續檢查是否接近下一個導航點
+      if (routeLoaded) {
+        checkRouteProgress(lat, lon);
+      }
+    }
+
+    function handleGPSError(error) {
+      let msg = "";
+
+      if (error.code === 1) {
+        msg = "Permission denied. Please allow location access.";
+      } else if (error.code === 2) {
+        msg = "Position unavailable.";
+      } else if (error.code === 3) {
+        msg = "GPS timeout.";
+      } else {
+        msg = "Unknown GPS error.";
+      }
+
+      document.getElementById("status").innerHTML = msg;
+    }
+
+    function requestRoute(startLat, startLon) {
+      routeRequesting = true;
+
+      const url =
+        SERVER_BASE_URL +
+        "/route?start_lat=" + encodeURIComponent(startLat) +
+        "&start_lon=" + encodeURIComponent(startLon) +
+        "&dest_lat=" + encodeURIComponent(DEST_LAT) +
+        "&dest_lon=" + encodeURIComponent(DEST_LON);
+
       document.getElementById("status").innerHTML =
-        "<span class='trigger'>Sending command to server: " + action + "</span>";
-    
-      fetch(serverUrl)
+        "Requesting route from Render...";
+
+      document.getElementById("routeStatus").innerHTML =
+        "Requesting route...";
+
+      fetch(url)
         .then(response => response.json())
         .then(data => {
+          routeRequesting = false;
+
+          if (!data.ok) {
+            routeLoaded = false;
+            document.getElementById("status").innerHTML =
+              "Route failed: " + data.message;
+            document.getElementById("routeStatus").innerHTML =
+              "Route failed.";
+            return;
+          }
+
+          routePoints = data.route;
+
+          // 0 通常是起點，手機可能一開始就很接近，所以從第 1 個點開始導航
+          if (routePoints.length > 1) {
+            currentRouteIndex = 1;
+          } else {
+            currentRouteIndex = 0;
+          }
+
+          lastSentIndex = -1;
+          routeLoaded = true;
+
+          document.getElementById("routeStatus").innerHTML =
+            "Route loaded" +
+            "<br>Points: " + routePoints.length +
+            "<br>Start node: " + data.start_node +
+            "<br>Dest node: " + data.dest_node +
+            "<br>Total cost: " + Number(data.total_cost).toFixed(2);
+
           document.getElementById("status").innerHTML =
-            "<span class='trigger'>Command sent to server: " + action + "</span>";
+            "Route loaded. Start navigation.";
+
+          updateNextPointDisplay();
         })
         .catch(error => {
+          routeRequesting = false;
+          routeLoaded = false;
+
           document.getElementById("status").innerHTML =
-            "Failed to send command to server.";
+            "Failed to request route.";
+          document.getElementById("routeStatus").innerHTML =
+            "Route request error.";
+
+          console.error(error);
         });
     }
 
-    function resetTrigger() {
-      hasTriggered = false;
-      document.getElementById("status").innerHTML = "Trigger reset. Press Start GPS again if needed.";
+    function checkRouteProgress(currentLat, currentLon) {
+      if (!routeLoaded || routePoints.length === 0) {
+        return;
+      }
+
+      if (currentRouteIndex >= routePoints.length) {
+        document.getElementById("status").innerHTML =
+          "Navigation finished.";
+        document.getElementById("nextPoint").innerHTML =
+          "Arrived.";
+        document.getElementById("dist").innerHTML =
+          "--";
+        document.getElementById("action").innerHTML =
+          "--";
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      const d = distanceMeters(
+        currentLat,
+        currentLon,
+        target.lat,
+        target.lon
+      );
+
+      document.getElementById("nextPoint").innerHTML =
+        "Index: " + currentRouteIndex +
+        "<br>Node: " + target.node_id +
+        "<br>Lat: " + Number(target.lat).toFixed(8) +
+        "<br>Lon: " + Number(target.lon).toFixed(8);
+
+      document.getElementById("dist").innerHTML =
+        d.toFixed(1) + " m";
+
+      document.getElementById("action").innerHTML =
+        target.action;
+
+      if (d <= TRIGGER_DISTANCE && lastSentIndex !== currentRouteIndex) {
+        lastSentIndex = currentRouteIndex;
+
+        document.getElementById("status").innerHTML =
+          "<span class='trigger'>Trigger: " + target.action + "</span>";
+
+        sendCommandToESP32(target.action);
+
+        currentRouteIndex++;
+
+        updateNextPointDisplay();
+      } else {
+        document.getElementById("status").innerHTML =
+          "GPS updated. Navigating...";
+      }
+    }
+
+    function updateNextPointDisplay() {
+      if (!routeLoaded || routePoints.length === 0) {
+        document.getElementById("nextPoint").innerHTML =
+          "No route yet";
+        document.getElementById("action").innerHTML =
+          "--";
+        return;
+      }
+
+      if (currentRouteIndex >= routePoints.length) {
+        document.getElementById("nextPoint").innerHTML =
+          "Arrived.";
+        document.getElementById("action").innerHTML =
+          "--";
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      document.getElementById("nextPoint").innerHTML =
+        "Index: " + currentRouteIndex +
+        "<br>Node: " + target.node_id +
+        "<br>Lat: " + Number(target.lat).toFixed(8) +
+        "<br>Lon: " + Number(target.lon).toFixed(8);
+
+      document.getElementById("action").innerHTML =
+        target.action;
+    }
+
+    function sendCommandToESP32(action) {
+      const serverUrl =
+        SERVER_BASE_URL + "/set?dir=" + encodeURIComponent(action);
+
+      document.getElementById("commandStatus").innerHTML =
+        "Sending command: " + action;
+
+      fetch(serverUrl)
+        .then(response => response.json())
+        .then(data => {
+          if (!data.ok) {
+            document.getElementById("commandStatus").innerHTML =
+              "Command failed: " + action;
+            return;
+          }
+
+          document.getElementById("commandStatus").innerHTML =
+            "Command sent: " + action + ", seq=" + data.seq;
+        })
+        .catch(error => {
+          document.getElementById("commandStatus").innerHTML =
+            "Failed to send command.";
+          console.error(error);
+        });
+    }
+
+    function resetRoute() {
+      routePoints = [];
+      currentRouteIndex = 0;
+      routeLoaded = false;
+      routeRequesting = false;
+      lastSentIndex = -1;
+
+      document.getElementById("routeStatus").innerHTML =
+        "No route yet";
+      document.getElementById("nextPoint").innerHTML =
+        "--";
+      document.getElementById("dist").innerHTML =
+        "--";
+      document.getElementById("action").innerHTML =
+        "--";
+      document.getElementById("commandStatus").innerHTML =
+        "No command sent yet";
+      document.getElementById("status").innerHTML =
+        "Route reset. GPS is still running if already started.";
+
+      // 如果 GPS 還在跑，下一次 GPS 更新會重新 requestRoute()
+    }
+
+    function stopGPS() {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+
+      document.getElementById("status").innerHTML =
+        "GPS stopped.";
     }
 
     function distanceMeters(lat1, lon1, lat2, lon2) {
       const R = 6371000;
+
       const phi1 = lat1 * Math.PI / 180;
       const phi2 = lat2 * Math.PI / 180;
+
       const dPhi = (lat2 - lat1) * Math.PI / 180;
       const dLambda = (lon2 - lon1) * Math.PI / 180;
 
