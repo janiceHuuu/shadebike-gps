@@ -70,6 +70,14 @@
       background: #c0392b;
     }
 
+    .time-btn {
+      background: #8e44ad;
+    }
+
+    .active-time {
+      outline: 5px solid #f1c40f;
+    }
+
     .status {
       font-size: 20px;
       color: #333;
@@ -153,20 +161,29 @@
   <h1>ShadeBike GPS Navigation</h1>
 
   <button onclick="startGPS()">Start GPS</button>
+
+  <button id="btn8AM" class="time-btn active-time" onclick="setTimeSlot('8AM')">Use 8AM Route</button>
+  <button id="btn5PM" class="time-btn" onclick="setTimeSlot('5PM')">Use 5PM Route</button>
+
   <button class="go-btn" onclick="requestRouteBySelectedDestination()">Go to Selected Point</button>
+
   <button class="test-btn" onclick="sendCommandToESP32('R')">Test Send R to ESP32</button>
   <button class="test-btn" onclick="sendCommandToESP32('L')">Test Send L to ESP32</button>
   <button class="test-btn" onclick="sendCommandToESP32('A')">Test Send A to ESP32</button>
+
   <button class="reset-btn" onclick="resetRoute()">Reset Route</button>
   <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
 
   <div class="hint">
-    先按 Start GPS，等目前位置出現後，在地圖上點目的地，再按 Go to Selected Point。
+    先按 Start GPS，等目前位置出現後，在地圖上點目的地，選 8AM 或 5PM，再按 Go to Selected Point。
   </div>
 
   <div id="map"></div>
 
   <div class="card">
+    <div class="label">Current Time Slot</div>
+    <div class="value" id="timeSlotDisplay">8AM</div>
+
     <div class="label">Current Latitude</div>
     <div class="value" id="lat">--</div>
 
@@ -214,6 +231,8 @@
     const DEFAULT_CENTER_LAT = 23.0015;
     const DEFAULT_CENTER_LON = 120.2190;
 
+    let selectedTimeSlot = "8AM";
+
     let watchId = null;
 
     let latestLat = null;
@@ -243,10 +262,33 @@
     let nextMarker = null;
 
     let routeLine = null;
+    let nodePathLine = null;
     let startConnectorLine = null;
     let destConnectorLine = null;
 
     let routePointMarkers = [];
+
+    function setTimeSlot(slot) {
+      selectedTimeSlot = slot;
+
+      document.getElementById("timeSlotDisplay").innerHTML = selectedTimeSlot;
+
+      const btn8 = document.getElementById("btn8AM");
+      const btn5 = document.getElementById("btn5PM");
+
+      if (slot === "8AM") {
+        btn8.classList.add("active-time");
+        btn5.classList.remove("active-time");
+      } else {
+        btn5.classList.add("active-time");
+        btn8.classList.remove("active-time");
+      }
+
+      resetRouteOnly();
+
+      document.getElementById("status").innerHTML =
+        "Time slot changed to " + selectedTimeSlot + ". Press Go to Selected Point again.";
+    }
 
     function makeIcon(text, className) {
       return L.divIcon({
@@ -423,10 +465,11 @@
         "/route?start_lat=" + encodeURIComponent(startLat) +
         "&start_lon=" + encodeURIComponent(startLon) +
         "&dest_lat=" + encodeURIComponent(destLat) +
-        "&dest_lon=" + encodeURIComponent(destLon);
+        "&dest_lon=" + encodeURIComponent(destLon) +
+        "&time_slot=" + encodeURIComponent(selectedTimeSlot);
 
       document.getElementById("status").innerHTML =
-        "Requesting route from Render...";
+        "Requesting " + selectedTimeSlot + " route from Render...";
 
       document.getElementById("routeStatus").innerHTML =
         "Requesting route...";
@@ -473,7 +516,7 @@
             : "";
 
           document.getElementById("routeStatus").innerHTML =
-            "Route loaded" +
+            "Route loaded: " + data.time_slot +
             "<br>Route points: " + routePoints.length +
             "<br>Geometry points: " + routeGeometry.length +
             "<br>Edges: " + edgeInfo.length +
@@ -482,7 +525,7 @@
             "<br>Total cost: " + Number(data.total_cost).toFixed(2);
 
           document.getElementById("status").innerHTML =
-            "Route loaded. Start navigation.";
+            data.time_slot + " route loaded. Start navigation.";
 
           drawRouteOnMap();
           updateNextPointDisplay();
@@ -523,18 +566,33 @@
         return;
       }
 
-      // 穩定版：用 routePoints 畫線
-      // 這可以保證藍線一定經過每個路徑節點，也會從 S 連到 E
-      const networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
+      const nodeLatLngs = routePoints.map(p => [p.lat, p.lon]);
 
-      if (networkLatLngs.length === 0) {
+      let roadLatLngs = [];
+
+      if (routeGeometry && routeGeometry.length > 0) {
+        roadLatLngs = routeGeometry;
+      } else {
+        roadLatLngs = nodeLatLngs;
+      }
+
+      if (roadLatLngs.length === 0) {
         return;
       }
 
-      routeLine = L.polyline(networkLatLngs, {
+      // 藍色實線：真正沿道路 geometry 的路線
+      routeLine = L.polyline(roadLatLngs, {
         color: "#2e86ff",
         weight: 6,
         opacity: 0.85
+      }).addTo(map);
+
+      // 灰色虛線：節點連線，用來檢查路徑節點順序
+      nodePathLine = L.polyline(nodeLatLngs, {
+        color: "#555555",
+        weight: 3,
+        opacity: 0.65,
+        dashArray: "6,8"
       }).addTo(map);
 
       drawSnapMarkers();
@@ -543,7 +601,11 @@
 
       updateNextMarker();
 
-      const bounds = L.latLngBounds(networkLatLngs);
+      const bounds = L.latLngBounds(roadLatLngs);
+
+      for (let i = 0; i < nodeLatLngs.length; i++) {
+        bounds.extend(nodeLatLngs[i]);
+      }
 
       if (currentMarker !== null) {
         bounds.extend(currentMarker.getLatLng());
@@ -837,6 +899,7 @@
     function clearRouteDrawing() {
       const layers = [
         routeLine,
+        nodePathLine,
         startConnectorLine,
         destConnectorLine,
         startSnapMarker,
@@ -851,6 +914,7 @@
       }
 
       routeLine = null;
+      nodePathLine = null;
       startConnectorLine = null;
       destConnectorLine = null;
       startSnapMarker = null;
