@@ -484,107 +484,58 @@
       if (map === null || routePoints.length === 0) {
         return;
       }
-
-      let networkLatLngs = [];
-
-      if (routeGeometry && routeGeometry.length > 0) {
-        networkLatLngs = routeGeometry;
-      } else {
-        networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
-      }
-
+    
+      // 這裡先不用 routeGeometry，改用 routePoints 畫線
+      // 這樣可以保證路線從 S 開始、從 E 結束，不會超出 E
+      const networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
+    
       if (networkLatLngs.length === 0) {
         return;
       }
-
+    
       routeLine = L.polyline(networkLatLngs, {
         color: "#2e86ff",
         weight: 6,
         opacity: 0.85
       }).addTo(map);
-
+    
       const firstRoutePoint = routePoints[0];
       const lastRoutePoint = routePoints[routePoints.length - 1];
-
+    
+      // S：吸附後的起點節點
       startSnapMarker = L.marker(
         [firstRoutePoint.lat, firstRoutePoint.lon],
         { icon: makeSmallIcon("S") }
       ).addTo(map);
       startSnapMarker.bindPopup("Snapped start node: " + firstRoutePoint.node_id);
-
+    
+      // E：吸附後的終點節點
       destSnapMarker = L.marker(
         [lastRoutePoint.lat, lastRoutePoint.lon],
         { icon: makeSmallIcon("E") }
       ).addTo(map);
       destSnapMarker.bindPopup("Snapped destination node: " + lastRoutePoint.node_id);
-
-      if (latestLat !== null && latestLon !== null) {
-        startConnectorLine = L.polyline(
-          [
-            [latestLat, latestLon],
-            [firstRoutePoint.lat, firstRoutePoint.lon]
-          ],
-          {
-            color: "#f39c12",
-            weight: 4,
-            opacity: 0.8,
-            dashArray: "8,8"
-          }
-        ).addTo(map);
-      }
-
-      if (selectedDestLat !== null && selectedDestLon !== null) {
-        destConnectorLine = L.polyline(
-          [
-            [lastRoutePoint.lat, lastRoutePoint.lon],
-            [selectedDestLat, selectedDestLon]
-          ],
-          {
-            color: "#c0392b",
-            weight: 4,
-            opacity: 0.8,
-            dashArray: "8,8"
-          }
-        ).addTo(map);
-      }
-
-      for (let i = 0; i < routePoints.length; i++) {
-        const p = routePoints[i];
-
-        const marker = L.circleMarker([p.lat, p.lon], {
-          radius: 5,
-          color: "#2e86ff",
-          weight: 2,
-          fillColor: "#2e86ff",
-          fillOpacity: 0.9
-        }).addTo(map);
-
-        marker.bindPopup(
-          "Index: " + i +
-          "<br>Node: " + p.node_id +
-          "<br>Action: " + p.action
-        );
-
-        routePointMarkers.push(marker);
-      }
-
+    
+      // 不再顯示每個 route point 的藍色小點，避免畫面混亂
+      routePointMarkers = [];
+    
       updateNextMarker();
-
+    
       const bounds = L.latLngBounds(networkLatLngs);
-
+    
       if (currentMarker !== null) {
         bounds.extend(currentMarker.getLatLng());
       }
-
+    
       if (destMarker !== null) {
         bounds.extend(destMarker.getLatLng());
       }
-
+    
       map.fitBounds(bounds, {
         padding: [30, 30]
       });
     }
-
+    
     function checkRouteProgress(currentLat, currentLon) {
       if (!routeLoaded || routePoints.length === 0) {
         return;
