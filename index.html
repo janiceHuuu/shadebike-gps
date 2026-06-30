@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ShadeBike GPS Navigation</title>
 
-  <!-- Leaflet 地圖套件 -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
@@ -89,12 +88,6 @@
       box-shadow: 0 2px 8px rgba(0,0,0,0.12);
       overflow: hidden;
     }
-
-    .small {
-      font-size: 15px;
-      color: #666;
-      line-height: 1.5;
-    }
   </style>
 </head>
 
@@ -151,26 +144,22 @@
   <div class="status" id="status">Press Start GPS</div>
 
   <script>
-    // ===== Render 後端網址 =====
     const SERVER_BASE_URL = "https://shadebike-server.onrender.com";
 
-    // ===== 固定目的地：目前先用你測試成功的目的地 =====
     const DEST_LAT = 23.0015;
     const DEST_LON = 120.2190;
 
-    // ===== 導航觸發距離 =====
-    const TRIGGER_DISTANCE = 10; // 公尺
+    const TRIGGER_DISTANCE = 10;
 
-    // ===== GPS / route 狀態 =====
     let watchId = null;
 
     let routePoints = [];
+    let routeGeometry = [];
     let currentRouteIndex = 0;
     let routeLoaded = false;
     let routeRequesting = false;
     let lastSentIndex = -1;
 
-    // ===== Leaflet 地圖狀態 =====
     let map = null;
     let currentMarker = null;
     let destMarker = null;
@@ -234,13 +223,11 @@
 
       updateCurrentLocationOnMap(lat, lon);
 
-      // 第一次取得 GPS 後，向 Render 要路徑
       if (!routeLoaded && !routeRequesting) {
         requestRoute(lat, lon);
         return;
       }
 
-      // 路徑載入後，持續檢查是否接近下一個導航點
       if (routeLoaded) {
         checkRouteProgress(lat, lon);
       }
@@ -296,8 +283,8 @@
           }
 
           routePoints = data.route;
+          routeGeometry = data.route_geometry || [];
 
-          // 0 通常是起點，手機一開始可能很接近，所以先從第 1 個點開始導航
           if (routePoints.length > 1) {
             currentRouteIndex = 1;
           } else {
@@ -310,6 +297,7 @@
           document.getElementById("routeStatus").innerHTML =
             "Route loaded" +
             "<br>Points: " + routePoints.length +
+            "<br>Geometry points: " + routeGeometry.length +
             "<br>Start node: " + data.start_node +
             "<br>Dest node: " + data.dest_node +
             "<br>Total cost: " + Number(data.total_cost).toFixed(2);
@@ -412,27 +400,29 @@
         return;
       }
 
-      const latlngs = routePoints.map(p => [p.lat, p.lon]);
+      let latlngs = [];
 
-      // 移除舊路線
+      if (routeGeometry && routeGeometry.length > 0) {
+        latlngs = routeGeometry;
+      } else {
+        latlngs = routePoints.map(p => [p.lat, p.lon]);
+      }
+
       if (routeLine !== null) {
         map.removeLayer(routeLine);
         routeLine = null;
       }
 
-      // 移除舊節點 marker
       for (let i = 0; i < routePointMarkers.length; i++) {
         map.removeLayer(routePointMarkers[i]);
       }
       routePointMarkers = [];
 
-      // 畫路線
       routeLine = L.polyline(latlngs, {
         weight: 6,
         opacity: 0.85
       }).addTo(map);
 
-      // 畫每個 route point
       for (let i = 0; i < routePoints.length; i++) {
         const p = routePoints[i];
 
@@ -560,6 +550,7 @@
 
     function resetRoute() {
       routePoints = [];
+      routeGeometry = [];
       currentRouteIndex = 0;
       routeLoaded = false;
       routeRequesting = false;
@@ -583,13 +574,11 @@
       document.getElementById("status").innerHTML =
         "Route reset. GPS is still running if already started.";
 
-      // 清除地圖上的路線
       if (routeLine !== null && map !== null) {
         map.removeLayer(routeLine);
         routeLine = null;
       }
 
-      // 清除 route point markers
       if (map !== null) {
         for (let i = 0; i < routePointMarkers.length; i++) {
           map.removeLayer(routePointMarkers[i]);
@@ -598,13 +587,10 @@
 
       routePointMarkers = [];
 
-      // 清除下一個導航點 marker
       if (nextMarker !== null && map !== null) {
         map.removeLayer(nextMarker);
         nextMarker = null;
       }
-
-      // 如果 GPS 還在跑，下一次 GPS 更新會重新 requestRoute()
     }
 
     function stopGPS() {
