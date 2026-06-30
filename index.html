@@ -127,10 +127,24 @@
 
     .marker-snap {
       background: #7f8c8d;
-      width: 22px;
-      height: 22px;
-      line-height: 22px;
-      font-size: 12px;
+      width: 26px;
+      height: 26px;
+      line-height: 26px;
+      font-size: 14px;
+    }
+
+    .node-label {
+      background: #2e86ff;
+      color: white;
+      border: 2px solid white;
+      border-radius: 50%;
+      width: 18px;
+      height: 18px;
+      line-height: 18px;
+      text-align: center;
+      font-size: 10px;
+      font-weight: bold;
+      box-shadow: 0 1px 5px rgba(0,0,0,0.35);
     }
   </style>
 </head>
@@ -211,12 +225,17 @@
 
     let routePoints = [];
     let routeGeometry = [];
+    let edgeInfo = [];
+    let startSnap = null;
+    let destSnap = null;
+
     let currentRouteIndex = 0;
     let routeLoaded = false;
     let routeRequesting = false;
     let lastSentIndex = -1;
 
     let map = null;
+
     let currentMarker = null;
     let destMarker = null;
     let startSnapMarker = null;
@@ -226,6 +245,7 @@
     let routeLine = null;
     let startConnectorLine = null;
     let destConnectorLine = null;
+
     let routePointMarkers = [];
 
     function makeIcon(text, className) {
@@ -241,8 +261,17 @@
       return L.divIcon({
         className: "",
         html: "<div class='custom-marker marker-snap'>" + text + "</div>",
-        iconSize: [22, 22],
-        iconAnchor: [11, 11]
+        iconSize: [26, 26],
+        iconAnchor: [13, 13]
+      });
+    }
+
+    function makeNodeIcon(text) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='node-label'>" + text + "</div>",
+        iconSize: [18, 18],
+        iconAnchor: [9, 9]
       });
     }
 
@@ -421,6 +450,9 @@
 
           routePoints = data.route || [];
           routeGeometry = data.route_geometry || [];
+          edgeInfo = data.edge_info || [];
+          startSnap = data.start_snap || null;
+          destSnap = data.dest_snap || null;
 
           if (routePoints.length === 0) {
             document.getElementById("status").innerHTML =
@@ -432,14 +464,21 @@
           lastSentIndex = -1;
           routeLoaded = true;
 
+          const startSnapText = startSnap
+            ? "<br>Start snap: " + Number(startSnap.distance_m).toFixed(1) + " m"
+            : "";
+
+          const destSnapText = destSnap
+            ? "<br>Dest snap: " + Number(destSnap.distance_m).toFixed(1) + " m"
+            : "";
+
           document.getElementById("routeStatus").innerHTML =
             "Route loaded" +
-            "<br>Points: " + routePoints.length +
+            "<br>Route points: " + routePoints.length +
             "<br>Geometry points: " + routeGeometry.length +
-            "<br>Start node: " + data.start_node +
-            "<br>Dest node: " + data.dest_node +
-            "<br>Start snap distance: " + Number(data.start_distance_m).toFixed(1) + " m" +
-            "<br>Dest snap distance: " + Number(data.dest_distance_m).toFixed(1) + " m" +
+            "<br>Edges: " + edgeInfo.length +
+            startSnapText +
+            destSnapText +
             "<br>Total cost: " + Number(data.total_cost).toFixed(2);
 
           document.getElementById("status").innerHTML =
@@ -473,7 +512,6 @@
           { icon: makeIcon("C", "marker-current") }
         ).addTo(map);
         currentMarker.bindPopup("Current Location");
-
         map.setView([lat, lon], 17);
       } else {
         currentMarker.setLatLng([lat, lon]);
@@ -484,63 +522,156 @@
       if (map === null || routePoints.length === 0) {
         return;
       }
-    
+
       let networkLatLngs = [];
-    
-      // 優先使用後端裁切後的道路 geometry
+
       if (routeGeometry && routeGeometry.length > 0) {
         networkLatLngs = routeGeometry;
       } else {
         networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
       }
-    
+
       if (networkLatLngs.length === 0) {
         return;
       }
-    
+
       routeLine = L.polyline(networkLatLngs, {
         color: "#2e86ff",
         weight: 6,
         opacity: 0.85
       }).addTo(map);
-    
-      const firstRoutePoint = routePoints[0];
-      const lastRoutePoint = routePoints[routePoints.length - 1];
-    
-      // S：吸附後的起點節點
-      startSnapMarker = L.marker(
-        [firstRoutePoint.lat, firstRoutePoint.lon],
-        { icon: makeSmallIcon("S") }
-      ).addTo(map);
-      startSnapMarker.bindPopup("Snapped start node: " + firstRoutePoint.node_id);
-    
-      // E：吸附後的終點節點
-      destSnapMarker = L.marker(
-        [lastRoutePoint.lat, lastRoutePoint.lon],
-        { icon: makeSmallIcon("E") }
-      ).addTo(map);
-      destSnapMarker.bindPopup("Snapped destination node: " + lastRoutePoint.node_id);
-    
-      // 不顯示所有 route point 小藍點，避免畫面混亂
-      routePointMarkers = [];
-    
+
+      drawSnapMarkers();
+      drawConnectorLines();
+      drawRouteNodeMarkers();
+
       updateNextMarker();
-    
+
       const bounds = L.latLngBounds(networkLatLngs);
-    
+
       if (currentMarker !== null) {
         bounds.extend(currentMarker.getLatLng());
       }
-    
+
       if (destMarker !== null) {
         bounds.extend(destMarker.getLatLng());
       }
-    
+
       map.fitBounds(bounds, {
         padding: [30, 30]
       });
     }
-    
+
+    function drawSnapMarkers() {
+      let sLat = null;
+      let sLon = null;
+      let eLat = null;
+      let eLon = null;
+
+      if (startSnap) {
+        sLat = startSnap.lat;
+        sLon = startSnap.lon;
+      } else if (routePoints.length > 0) {
+        sLat = routePoints[0].lat;
+        sLon = routePoints[0].lon;
+      }
+
+      if (destSnap) {
+        eLat = destSnap.lat;
+        eLon = destSnap.lon;
+      } else if (routePoints.length > 0) {
+        const last = routePoints[routePoints.length - 1];
+        eLat = last.lat;
+        eLon = last.lon;
+      }
+
+      if (sLat !== null && sLon !== null) {
+        startSnapMarker = L.marker(
+          [sLat, sLon],
+          { icon: makeSmallIcon("S") }
+        ).addTo(map);
+
+        const snapText = startSnap
+          ? "Start snap<br>Road ID: " + startSnap.road_id +
+            "<br>Distance: " + Number(startSnap.distance_m).toFixed(1) + " m"
+          : "Start snap";
+
+        startSnapMarker.bindPopup(snapText);
+      }
+
+      if (eLat !== null && eLon !== null) {
+        destSnapMarker = L.marker(
+          [eLat, eLon],
+          { icon: makeSmallIcon("E") }
+        ).addTo(map);
+
+        const snapText = destSnap
+          ? "Destination snap<br>Road ID: " + destSnap.road_id +
+            "<br>Distance: " + Number(destSnap.distance_m).toFixed(1) + " m"
+          : "Destination snap";
+
+        destSnapMarker.bindPopup(snapText);
+      }
+    }
+
+    function drawConnectorLines() {
+      if (startSnap && latestLat !== null && latestLon !== null) {
+        startConnectorLine = L.polyline(
+          [
+            [latestLat, latestLon],
+            [startSnap.lat, startSnap.lon]
+          ],
+          {
+            color: "#f39c12",
+            weight: 4,
+            opacity: 0.8,
+            dashArray: "8,8"
+          }
+        ).addTo(map);
+      }
+
+      if (destSnap && selectedDestLat !== null && selectedDestLon !== null) {
+        destConnectorLine = L.polyline(
+          [
+            [destSnap.lat, destSnap.lon],
+            [selectedDestLat, selectedDestLon]
+          ],
+          {
+            color: "#c0392b",
+            weight: 4,
+            opacity: 0.8,
+            dashArray: "8,8"
+          }
+        ).addTo(map);
+      }
+    }
+
+    function drawRouteNodeMarkers() {
+      for (let i = 0; i < routePoints.length; i++) {
+        const p = routePoints[i];
+
+        if (p.node_id === "S" || p.node_id === "E") {
+          continue;
+        }
+
+        const label = String(i);
+
+        const marker = L.marker(
+          [p.lat, p.lon],
+          { icon: makeNodeIcon(label) }
+        ).addTo(map);
+
+        marker.bindPopup(
+          "Route index: " + i +
+          "<br>Node: " + p.node_id +
+          "<br>Raw node: " + p.raw_node_id +
+          "<br>Action: " + p.action
+        );
+
+        routePointMarkers.push(marker);
+      }
+    }
+
     function checkRouteProgress(currentLat, currentLon) {
       if (!routeLoaded || routePoints.length === 0) {
         return;
@@ -673,6 +804,10 @@
     function resetRouteOnly() {
       routePoints = [];
       routeGeometry = [];
+      edgeInfo = [];
+      startSnap = null;
+      destSnap = null;
+
       currentRouteIndex = 0;
       routeLoaded = false;
       routeRequesting = false;
