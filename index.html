@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ShadeBike GPS Navigation</title>
 
+  <!-- Leaflet 地圖套件 -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -76,6 +80,16 @@
       font-weight: bold;
     }
 
+    #map {
+      width: 100%;
+      max-width: 430px;
+      height: 380px;
+      margin: 16px auto;
+      border-radius: 16px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+      overflow: hidden;
+    }
+
     .small {
       font-size: 15px;
       color: #666;
@@ -93,6 +107,8 @@
   <button class="test-btn" onclick="sendCommandToESP32('A')">Test Send A to ESP32</button>
   <button class="reset-btn" onclick="resetRoute()">Reset Route</button>
   <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
+
+  <div id="map"></div>
 
   <div class="card">
     <div class="label">Current Latitude</div>
@@ -138,7 +154,7 @@
     // ===== Render 後端網址 =====
     const SERVER_BASE_URL = "https://shadebike-server.onrender.com";
 
-    // ===== 固定目的地，先用你剛剛測 /route 成功的目的地 =====
+    // ===== 固定目的地：目前先用你測試成功的目的地 =====
     const DEST_LAT = 23.0015;
     const DEST_LON = 120.2190;
 
@@ -154,7 +170,33 @@
     let routeRequesting = false;
     let lastSentIndex = -1;
 
+    // ===== Leaflet 地圖狀態 =====
+    let map = null;
+    let currentMarker = null;
+    let destMarker = null;
+    let routeLine = null;
+    let nextMarker = null;
+    let routePointMarkers = [];
+
+    function initMap() {
+      if (map !== null) {
+        return;
+      }
+
+      map = L.map("map").setView([DEST_LAT, DEST_LON], 16);
+
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 20,
+        attribution: "© OpenStreetMap"
+      }).addTo(map);
+
+      destMarker = L.marker([DEST_LAT, DEST_LON]).addTo(map);
+      destMarker.bindPopup("Destination");
+    }
+
     function startGPS() {
+      initMap();
+
       if (!navigator.geolocation) {
         document.getElementById("status").innerHTML =
           "This browser does not support GPS.";
@@ -189,6 +231,8 @@
       document.getElementById("lat").innerHTML = lat.toFixed(8);
       document.getElementById("lon").innerHTML = lon.toFixed(8);
       document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
+
+      updateCurrentLocationOnMap(lat, lon);
 
       // 第一次取得 GPS 後，向 Render 要路徑
       if (!routeLoaded && !routeRequesting) {
@@ -241,16 +285,19 @@
 
           if (!data.ok) {
             routeLoaded = false;
+
             document.getElementById("status").innerHTML =
               "Route failed: " + data.message;
+
             document.getElementById("routeStatus").innerHTML =
               "Route failed.";
+
             return;
           }
 
           routePoints = data.route;
 
-          // 0 通常是起點，手機可能一開始就很接近，所以從第 1 個點開始導航
+          // 0 通常是起點，手機一開始可能很接近，所以先從第 1 個點開始導航
           if (routePoints.length > 1) {
             currentRouteIndex = 1;
           } else {
@@ -270,6 +317,7 @@
           document.getElementById("status").innerHTML =
             "Route loaded. Start navigation.";
 
+          drawRouteOnMap();
           updateNextPointDisplay();
         })
         .catch(error => {
@@ -278,6 +326,7 @@
 
           document.getElementById("status").innerHTML =
             "Failed to request route.";
+
           document.getElementById("routeStatus").innerHTML =
             "Route request error.";
 
@@ -293,12 +342,17 @@
       if (currentRouteIndex >= routePoints.length) {
         document.getElementById("status").innerHTML =
           "Navigation finished.";
+
         document.getElementById("nextPoint").innerHTML =
           "Arrived.";
+
         document.getElementById("dist").innerHTML =
           "--";
+
         document.getElementById("action").innerHTML =
           "--";
+
+        updateNextMarker();
         return;
       }
 
@@ -340,20 +394,98 @@
       }
     }
 
+    function updateCurrentLocationOnMap(lat, lon) {
+      if (map === null) {
+        return;
+      }
+
+      if (currentMarker === null) {
+        currentMarker = L.marker([lat, lon]).addTo(map);
+        currentMarker.bindPopup("Current Location");
+      } else {
+        currentMarker.setLatLng([lat, lon]);
+      }
+    }
+
+    function drawRouteOnMap() {
+      if (map === null || routePoints.length === 0) {
+        return;
+      }
+
+      const latlngs = routePoints.map(p => [p.lat, p.lon]);
+
+      // 移除舊路線
+      if (routeLine !== null) {
+        map.removeLayer(routeLine);
+        routeLine = null;
+      }
+
+      // 移除舊節點 marker
+      for (let i = 0; i < routePointMarkers.length; i++) {
+        map.removeLayer(routePointMarkers[i]);
+      }
+      routePointMarkers = [];
+
+      // 畫路線
+      routeLine = L.polyline(latlngs, {
+        weight: 6,
+        opacity: 0.85
+      }).addTo(map);
+
+      // 畫每個 route point
+      for (let i = 0; i < routePoints.length; i++) {
+        const p = routePoints[i];
+
+        const marker = L.circleMarker([p.lat, p.lon], {
+          radius: 6,
+          weight: 2,
+          fillOpacity: 0.9
+        }).addTo(map);
+
+        marker.bindPopup(
+          "Index: " + i +
+          "<br>Node: " + p.node_id +
+          "<br>Action: " + p.action
+        );
+
+        routePointMarkers.push(marker);
+      }
+
+      updateNextMarker();
+
+      const bounds = L.latLngBounds(latlngs);
+
+      if (currentMarker !== null) {
+        bounds.extend(currentMarker.getLatLng());
+      }
+
+      bounds.extend([DEST_LAT, DEST_LON]);
+
+      map.fitBounds(bounds, {
+        padding: [30, 30]
+      });
+    }
+
     function updateNextPointDisplay() {
       if (!routeLoaded || routePoints.length === 0) {
         document.getElementById("nextPoint").innerHTML =
           "No route yet";
+
         document.getElementById("action").innerHTML =
           "--";
+
+        updateNextMarker();
         return;
       }
 
       if (currentRouteIndex >= routePoints.length) {
         document.getElementById("nextPoint").innerHTML =
           "Arrived.";
+
         document.getElementById("action").innerHTML =
           "--";
+
+        updateNextMarker();
         return;
       }
 
@@ -367,6 +499,36 @@
 
       document.getElementById("action").innerHTML =
         target.action;
+
+      updateNextMarker();
+    }
+
+    function updateNextMarker() {
+      if (map === null) {
+        return;
+      }
+
+      if (!routeLoaded || routePoints.length === 0 || currentRouteIndex >= routePoints.length) {
+        if (nextMarker !== null) {
+          map.removeLayer(nextMarker);
+          nextMarker = null;
+        }
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      if (nextMarker === null) {
+        nextMarker = L.marker([target.lat, target.lon]).addTo(map);
+      } else {
+        nextMarker.setLatLng([target.lat, target.lon]);
+      }
+
+      nextMarker.bindPopup(
+        "Next action: " + target.action +
+        "<br>Node: " + target.node_id +
+        "<br>Index: " + currentRouteIndex
+      );
     }
 
     function sendCommandToESP32(action) {
@@ -391,6 +553,7 @@
         .catch(error => {
           document.getElementById("commandStatus").innerHTML =
             "Failed to send command.";
+
           console.error(error);
         });
     }
@@ -404,16 +567,42 @@
 
       document.getElementById("routeStatus").innerHTML =
         "No route yet";
+
       document.getElementById("nextPoint").innerHTML =
         "--";
+
       document.getElementById("dist").innerHTML =
         "--";
+
       document.getElementById("action").innerHTML =
         "--";
+
       document.getElementById("commandStatus").innerHTML =
         "No command sent yet";
+
       document.getElementById("status").innerHTML =
         "Route reset. GPS is still running if already started.";
+
+      // 清除地圖上的路線
+      if (routeLine !== null && map !== null) {
+        map.removeLayer(routeLine);
+        routeLine = null;
+      }
+
+      // 清除 route point markers
+      if (map !== null) {
+        for (let i = 0; i < routePointMarkers.length; i++) {
+          map.removeLayer(routePointMarkers[i]);
+        }
+      }
+
+      routePointMarkers = [];
+
+      // 清除下一個導航點 marker
+      if (nextMarker !== null && map !== null) {
+        map.removeLayer(nextMarker);
+        nextMarker = null;
+      }
 
       // 如果 GPS 還在跑，下一次 GPS 更新會重新 requestRoute()
     }
