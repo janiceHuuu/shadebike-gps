@@ -485,9 +485,14 @@
         return;
       }
     
-      // 這裡先不用 routeGeometry，改用 routePoints 畫線
-      // 這樣可以保證路線從 S 開始、從 E 結束，不會超出 E
-      const networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
+      let networkLatLngs = [];
+    
+      // 優先使用後端裁切後的道路 geometry
+      if (routeGeometry && routeGeometry.length > 0) {
+        networkLatLngs = routeGeometry;
+      } else {
+        networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
+      }
     
       if (networkLatLngs.length === 0) {
         return;
@@ -516,7 +521,7 @@
       ).addTo(map);
       destSnapMarker.bindPopup("Snapped destination node: " + lastRoutePoint.node_id);
     
-      // 不再顯示每個 route point 的藍色小點，避免畫面混亂
+      // 不顯示所有 route point 小藍點，避免畫面混亂
       routePointMarkers = [];
     
       updateNextMarker();
