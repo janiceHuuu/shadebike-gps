@@ -66,6 +66,10 @@
       background: #c0392b;
     }
 
+    .go-btn {
+      background: #27ae60;
+    }
+
     .status {
       font-size: 20px;
       color: #333;
@@ -82,11 +86,17 @@
     #map {
       width: 100%;
       max-width: 430px;
-      height: 380px;
+      height: 420px;
       margin: 16px auto;
       border-radius: 16px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.12);
       overflow: hidden;
+    }
+
+    .hint {
+      font-size: 15px;
+      color: #666;
+      margin-top: 8px;
     }
   </style>
 </head>
@@ -94,12 +104,15 @@
 <body>
   <h1>ShadeBike GPS Navigation</h1>
 
-  <button onclick="startGPS()">Start GPS and Request Route</button>
+  <button onclick="startGPS()">Start GPS</button>
+  <button class="go-btn" onclick="requestRouteBySelectedDestination()">Go to Selected Point</button>
   <button class="test-btn" onclick="sendCommandToESP32('R')">Test Send R to ESP32</button>
   <button class="test-btn" onclick="sendCommandToESP32('L')">Test Send L to ESP32</button>
   <button class="test-btn" onclick="sendCommandToESP32('A')">Test Send A to ESP32</button>
   <button class="reset-btn" onclick="resetRoute()">Reset Route</button>
   <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
+
+  <div class="hint">請先按 Start GPS，再直接在地圖上點選目的地。</div>
 
   <div id="map"></div>
 
@@ -115,11 +128,11 @@
   </div>
 
   <div class="card">
-    <div class="label">Destination</div>
-    <div class="value" id="dest">23.0015, 120.2190</div>
+    <div class="label">Selected Destination</div>
+    <div class="value" id="dest">請在地圖上點選目的地</div>
 
     <div class="label">Trigger Radius</div>
-    <div class="value" id="radius">10 m</div>
+    <div class="value" id="radius">20 m</div>
   </div>
 
   <div class="card">
@@ -146,12 +159,21 @@
   <script>
     const SERVER_BASE_URL = "https://shadebike-server.onrender.com";
 
-    const DEST_LAT = 23.0015;
-    const DEST_LON = 120.2190;
+    // 觸發距離。手機 GPS 誤差常常 10 m 以上，所以先用 20 m 比較穩
+    const TRIGGER_DISTANCE = 20;
 
-    const TRIGGER_DISTANCE = 10;
+    // 成大附近預設地圖中心
+    const DEFAULT_CENTER_LAT = 23.0015;
+    const DEFAULT_CENTER_LON = 120.2190;
 
     let watchId = null;
+
+    let latestLat = null;
+    let latestLon = null;
+    let latestAcc = null;
+
+    let selectedDestLat = null;
+    let selectedDestLon = null;
 
     let routePoints = [];
     let routeGeometry = [];
@@ -172,8 +194,9 @@
         return;
       }
 
-      map = L.map("map").setView([DEST_LAT, DEST_LON], 16);
+      map = L.map("map").setView([DEFAULT_CENTER_LAT, DEFAULT_CENTER_LON], 16);
 
+      // ArcGIS Pro 使用的 World_Topo_Map 底圖
       L.tileLayer(
         "https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
         {
@@ -182,8 +205,34 @@
         }
       ).addTo(map);
 
-      destMarker = L.marker([DEST_LAT, DEST_LON]).addTo(map);
-      destMarker.bindPopup("Destination");
+      map.on("click", function(e) {
+        setDestination(e.latlng.lat, e.latlng.lng);
+      });
+    }
+
+    function setDestination(lat, lon) {
+      selectedDestLat = lat;
+      selectedDestLon = lon;
+
+      document.getElementById("dest").innerHTML =
+        lat.toFixed(8) + ", " + lon.toFixed(8);
+
+      if (destMarker === null) {
+        destMarker = L.marker([lat, lon]).addTo(map);
+        destMarker.bindPopup("Selected Destination");
+      } else {
+        destMarker.setLatLng([lat, lon]);
+      }
+
+      destMarker.openPopup();
+
+      document.getElementById("status").innerHTML =
+        "Destination selected. Press Go to Selected Point.";
+
+      // 如果已經有 GPS，可以自動算路
+      if (latestLat !== null && latestLon !== null) {
+        requestRoute(latestLat, latestLon, selectedDestLat, selectedDestLon);
+      }
     }
 
     function startGPS() {
@@ -220,6 +269,10 @@
       const lon = position.coords.longitude;
       const acc = position.coords.accuracy;
 
+      latestLat = lat;
+      latestLon = lon;
+      latestAcc = acc;
+
       document.getElementById("lat").innerHTML = lat.toFixed(8);
       document.getElementById("lon").innerHTML = lon.toFixed(8);
       document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
@@ -227,7 +280,13 @@
       updateCurrentLocationOnMap(lat, lon);
 
       if (!routeLoaded && !routeRequesting) {
-        requestRoute(lat, lon);
+        if (selectedDestLat === null || selectedDestLon === null) {
+          document.getElementById("status").innerHTML =
+            "GPS ready. Please tap a destination on the map.";
+          return;
+        }
+
+        requestRoute(lat, lon, selectedDestLat, selectedDestLon);
         return;
       }
 
@@ -252,15 +311,34 @@
       document.getElementById("status").innerHTML = msg;
     }
 
-    function requestRoute(startLat, startLon) {
+    function requestRouteBySelectedDestination() {
+      if (latestLat === null || latestLon === null) {
+        document.getElementById("status").innerHTML =
+          "GPS not ready. Press Start GPS first.";
+        return;
+      }
+
+      if (selectedDestLat === null || selectedDestLon === null) {
+        document.getElementById("status").innerHTML =
+          "Please tap a destination on the map first.";
+        return;
+      }
+
+      requestRoute(latestLat, latestLon, selectedDestLat, selectedDestLon);
+    }
+
+    function requestRoute(startLat, startLon, destLat, destLon) {
       routeRequesting = true;
+      routeLoaded = false;
+
+      clearRouteDrawing();
 
       const url =
         SERVER_BASE_URL +
         "/route?start_lat=" + encodeURIComponent(startLat) +
         "&start_lon=" + encodeURIComponent(startLon) +
-        "&dest_lat=" + encodeURIComponent(DEST_LAT) +
-        "&dest_lon=" + encodeURIComponent(DEST_LON);
+        "&dest_lat=" + encodeURIComponent(destLat) +
+        "&dest_lon=" + encodeURIComponent(destLon);
 
       document.getElementById("status").innerHTML =
         "Requesting route from Render...";
@@ -393,6 +471,8 @@
       if (currentMarker === null) {
         currentMarker = L.marker([lat, lon]).addTo(map);
         currentMarker.bindPopup("Current Location");
+
+        map.setView([lat, lon], 17);
       } else {
         currentMarker.setLatLng([lat, lon]);
       }
@@ -410,17 +490,6 @@
       } else {
         latlngs = routePoints.map(p => [p.lat, p.lon]);
       }
-
-      if (routeLine !== null) {
-        map.removeLayer(routeLine);
-        routeLine = null;
-      }
-
-      for (let i = 0; i < routePointMarkers.length; i++) {
-        map.removeLayer(routePointMarkers[i]);
-      }
-
-      routePointMarkers = [];
 
       routeLine = L.polyline(latlngs, {
         weight: 6,
@@ -453,11 +522,33 @@
         bounds.extend(currentMarker.getLatLng());
       }
 
-      bounds.extend([DEST_LAT, DEST_LON]);
+      if (destMarker !== null) {
+        bounds.extend(destMarker.getLatLng());
+      }
 
       map.fitBounds(bounds, {
         padding: [30, 30]
       });
+    }
+
+    function clearRouteDrawing() {
+      if (routeLine !== null && map !== null) {
+        map.removeLayer(routeLine);
+        routeLine = null;
+      }
+
+      if (map !== null) {
+        for (let i = 0; i < routePointMarkers.length; i++) {
+          map.removeLayer(routePointMarkers[i]);
+        }
+      }
+
+      routePointMarkers = [];
+
+      if (nextMarker !== null && map !== null) {
+        map.removeLayer(nextMarker);
+        nextMarker = null;
+      }
     }
 
     function updateNextPointDisplay() {
@@ -576,25 +667,9 @@
         "No command sent yet";
 
       document.getElementById("status").innerHTML =
-        "Route reset. GPS is still running if already started.";
+        "Route reset. You can tap another destination.";
 
-      if (routeLine !== null && map !== null) {
-        map.removeLayer(routeLine);
-        routeLine = null;
-      }
-
-      if (map !== null) {
-        for (let i = 0; i < routePointMarkers.length; i++) {
-          map.removeLayer(routePointMarkers[i]);
-        }
-      }
-
-      routePointMarkers = [];
-
-      if (nextMarker !== null && map !== null) {
-        map.removeLayer(nextMarker);
-        nextMarker = null;
-      }
+      clearRouteDrawing();
     }
 
     function stopGPS() {
