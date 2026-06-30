@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ShadeBike GPS Navigation Test</title>
+  <title>ShadeBike GPS Navigation</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
   <style>
     body {
@@ -33,7 +36,7 @@
     }
 
     .value {
-      font-size: 23px;
+      font-size: 22px;
       font-weight: bold;
       word-break: break-all;
     }
@@ -42,12 +45,17 @@
       width: 90%;
       max-width: 430px;
       padding: 18px;
-      font-size: 23px;
+      font-size: 22px;
       border: none;
       border-radius: 16px;
       color: white;
       background: #2980b9;
       margin-top: 14px;
+      cursor: pointer;
+    }
+
+    .go-btn {
+      background: #27ae60;
     }
 
     .test-btn {
@@ -56,6 +64,10 @@
 
     .reset-btn {
       background: #7f8c8d;
+    }
+
+    .stop-btn {
+      background: #c0392b;
     }
 
     .status {
@@ -68,16 +80,91 @@
     .trigger {
       color: #c0392b;
       font-size: 24px;
+      font-weight: bold;
+    }
+
+    .hint {
+      font-size: 15px;
+      color: #666;
+      margin-top: 8px;
+      line-height: 1.5;
+    }
+
+    #map {
+      width: 100%;
+      max-width: 430px;
+      height: 430px;
+      margin: 16px auto;
+      border-radius: 16px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+      overflow: hidden;
+    }
+
+    .custom-marker {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      color: white;
+      font-size: 18px;
+      font-weight: bold;
+      line-height: 34px;
+      text-align: center;
+      border: 3px solid white;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    }
+
+    .marker-current {
+      background: #2980b9;
+    }
+
+    .marker-dest {
+      background: #c0392b;
+    }
+
+    .marker-next {
+      background: #27ae60;
+    }
+
+    .marker-snap {
+      background: #7f8c8d;
+      width: 26px;
+      height: 26px;
+      line-height: 26px;
+      font-size: 14px;
+    }
+
+    .node-label {
+      background: #2e86ff;
+      color: white;
+      border: 2px solid white;
+      border-radius: 50%;
+      width: 22px;
+      height: 22px;
+      line-height: 22px;
+      text-align: center;
+      font-size: 11px;
+      font-weight: bold;
+      box-shadow: 0 1px 5px rgba(0,0,0,0.35);
     }
   </style>
 </head>
 
 <body>
-  <h1>ShadeBike GPS Navigation Test</h1>
+  <h1>ShadeBike GPS Navigation</h1>
 
   <button onclick="startGPS()">Start GPS</button>
-  <button class="test-btn" onclick="sendCommandToESP32(targetAction)">Test Send R to ESP32</button>
-  <button class="reset-btn" onclick="resetTrigger()">Reset Trigger</button>
+  <button class="go-btn" onclick="requestRouteBySelectedDestination()">Go to Selected Point</button>
+  <button class="test-btn" onclick="sendCommandToESP32('R')">Test Send R to ESP32</button>
+  <button class="test-btn" onclick="sendCommandToESP32('L')">Test Send L to ESP32</button>
+  <button class="test-btn" onclick="sendCommandToESP32('A')">Test Send A to ESP32</button>
+  <button class="reset-btn" onclick="resetRoute()">Reset Route</button>
+  <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
+
+  <div class="hint">
+    先按 Start GPS，等目前位置出現後，在地圖上點目的地，再按 Go to Selected Point。
+  </div>
+
+  <div id="map"></div>
 
   <div class="card">
     <div class="label">Current Latitude</div>
@@ -88,83 +175,175 @@
 
     <div class="label">Accuracy</div>
     <div class="value" id="acc">--</div>
-
-    <div class="label">Distance to Next Point</div>
-    <div class="value" id="dist">--</div>
   </div>
 
   <div class="card">
-    <div class="label">Next Action</div>
-    <div class="value" id="action">R</div>
+    <div class="label">Selected Destination</div>
+    <div class="value" id="dest">尚未選擇</div>
 
     <div class="label">Trigger Radius</div>
-    <div class="value">10 m</div>
+    <div class="value" id="radius">20 m</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Route Status</div>
+    <div class="value" id="routeStatus">No route yet</div>
+
+    <div class="label">Next Navigation Point</div>
+    <div class="value" id="nextPoint">--</div>
+
+    <div class="label">Distance to Next Point</div>
+    <div class="value" id="dist">--</div>
+
+    <div class="label">Next Action</div>
+    <div class="value" id="action">--</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Command Status</div>
+    <div class="value" id="commandStatus">No command sent yet</div>
   </div>
 
   <div class="status" id="status">Press Start GPS</div>
 
   <script>
-    // ===== ESP32 設定 =====
-    const esp32IP = "172.20.10.2";
+    const SERVER_BASE_URL = "https://shadebike-server.onrender.com";
 
-    // ===== 你的 GitHub Pages 網址 =====
-    const backUrl = "https://janicehuuu.github.io/shadebike-gps/";
+    const TRIGGER_DISTANCE = 20;
 
-    // ===== 測試導航點：目前設定成你剛剛提供的座標 =====
-    const targetLat = 22.99876019;
-    const targetLon = 120.21985536;
-    const targetAction = "R";
-    const triggerDistance = 10; // 公尺
+    const DEFAULT_CENTER_LAT = 23.0015;
+    const DEFAULT_CENTER_LON = 120.2190;
 
     let watchId = null;
-    let hasTriggered = false;
 
-    function startGPS() {
-      if (!navigator.geolocation) {
-        document.getElementById("status").innerHTML = "This browser does not support GPS.";
+    let latestLat = null;
+    let latestLon = null;
+    let latestAcc = null;
+
+    let selectedDestLat = null;
+    let selectedDestLon = null;
+
+    let routePoints = [];
+    let routeGeometry = [];
+    let edgeInfo = [];
+    let startSnap = null;
+    let destSnap = null;
+
+    let currentRouteIndex = 0;
+    let routeLoaded = false;
+    let routeRequesting = false;
+    let lastSentIndex = -1;
+
+    let map = null;
+
+    let currentMarker = null;
+    let destMarker = null;
+    let startSnapMarker = null;
+    let destSnapMarker = null;
+    let nextMarker = null;
+
+    let routeLine = null;
+    let startConnectorLine = null;
+    let destConnectorLine = null;
+
+    let routePointMarkers = [];
+
+    function makeIcon(text, className) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='custom-marker " + className + "'>" + text + "</div>",
+        iconSize: [34, 34],
+        iconAnchor: [17, 17]
+      });
+    }
+
+    function makeSmallIcon(text) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='custom-marker marker-snap'>" + text + "</div>",
+        iconSize: [26, 26],
+        iconAnchor: [13, 13]
+      });
+    }
+
+    function makeNodeIcon(text) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='node-label'>" + text + "</div>",
+        iconSize: [22, 22],
+        iconAnchor: [11, 11]
+      });
+    }
+
+    function initMap() {
+      if (map !== null) {
         return;
       }
 
-      document.getElementById("status").innerHTML = "Requesting GPS permission...";
+      map = L.map("map").setView([DEFAULT_CENTER_LAT, DEFAULT_CENTER_LON], 16);
+
+      L.tileLayer(
+        "https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        {
+          maxZoom: 19,
+          attribution: "Tiles © Esri"
+        }
+      ).addTo(map);
+
+      map.on("click", function(e) {
+        setDestination(e.latlng.lat, e.latlng.lng);
+      });
+    }
+
+    window.addEventListener("load", function() {
+      initMap();
+    });
+
+    function setDestination(lat, lon) {
+      selectedDestLat = lat;
+      selectedDestLon = lon;
+
+      document.getElementById("dest").innerHTML =
+        lat.toFixed(8) + ", " + lon.toFixed(8);
+
+      if (destMarker === null) {
+        destMarker = L.marker(
+          [lat, lon],
+          { icon: makeIcon("D", "marker-dest") }
+        ).addTo(map);
+      } else {
+        destMarker.setLatLng([lat, lon]);
+      }
+
+      destMarker.bindPopup("Selected Destination").openPopup();
+
+      resetRouteOnly();
+
+      document.getElementById("status").innerHTML =
+        "Destination selected. Press Go to Selected Point.";
+    }
+
+    function startGPS() {
+      initMap();
+
+      if (!navigator.geolocation) {
+        document.getElementById("status").innerHTML =
+          "This browser does not support GPS.";
+        return;
+      }
+
+      if (watchId !== null) {
+        document.getElementById("status").innerHTML =
+          "GPS is already running.";
+        return;
+      }
+
+      document.getElementById("status").innerHTML =
+        "Requesting GPS permission...";
 
       watchId = navigator.geolocation.watchPosition(
-        function(position) {
-          const lat = position.coords.latitude;
-          const lon = position.coords.longitude;
-          const acc = position.coords.accuracy;
-
-          const d = distanceMeters(lat, lon, targetLat, targetLon);
-
-          document.getElementById("lat").innerHTML = lat.toFixed(8);
-          document.getElementById("lon").innerHTML = lon.toFixed(8);
-          document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
-          document.getElementById("dist").innerHTML = d.toFixed(1) + " m";
-          document.getElementById("action").innerHTML = targetAction;
-
-          if (d <= triggerDistance && !hasTriggered) {
-            hasTriggered = true;
-
-            document.getElementById("status").innerHTML =
-              "<span class='trigger'>Trigger: " + targetAction + "</span>";
-
-            setTimeout(function() {
-              sendCommandToESP32(targetAction);
-            }, 500);
-          }
-          else if (!hasTriggered) {
-            document.getElementById("status").innerHTML = "GPS updated";
-          }
-        },
-        function(error) {
-          let msg = "";
-
-          if (error.code === 1) msg = "Permission denied. Please allow location access.";
-          else if (error.code === 2) msg = "Position unavailable.";
-          else if (error.code === 3) msg = "GPS timeout.";
-          else msg = "Unknown GPS error.";
-
-          document.getElementById("status").innerHTML = msg;
-        },
+        handlePosition,
+        handleGPSError,
         {
           enableHighAccuracy: true,
           timeout: 10000,
@@ -173,27 +352,563 @@
       );
     }
 
-    function sendCommandToESP32(action) {
-      const url =
-        "http://" + esp32IP +
-        "/cmd?dir=" + action +
-        "&silent=1";
-    
-      document.getElementById("status").innerHTML =
-        "<span class='trigger'>Sending to ESP32: " + action + "</span>";
-    
-      window.location.href = url;
+    function handlePosition(position) {
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+      const acc = position.coords.accuracy;
+
+      latestLat = lat;
+      latestLon = lon;
+      latestAcc = acc;
+
+      document.getElementById("lat").innerHTML = lat.toFixed(8);
+      document.getElementById("lon").innerHTML = lon.toFixed(8);
+      document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
+
+      updateCurrentLocationOnMap(lat, lon);
+
+      if (!routeLoaded && !routeRequesting) {
+        if (selectedDestLat === null || selectedDestLon === null) {
+          document.getElementById("status").innerHTML =
+            "GPS ready. Tap a destination on the map.";
+          return;
+        }
+      }
+
+      if (routeLoaded) {
+        checkRouteProgress(lat, lon);
+      }
     }
 
-    function resetTrigger() {
-      hasTriggered = false;
-      document.getElementById("status").innerHTML = "Trigger reset. Press Start GPS again if needed.";
+    function handleGPSError(error) {
+      let msg = "";
+
+      if (error.code === 1) {
+        msg = "Permission denied. Please allow location access.";
+      } else if (error.code === 2) {
+        msg = "Position unavailable.";
+      } else if (error.code === 3) {
+        msg = "GPS timeout.";
+      } else {
+        msg = "Unknown GPS error.";
+      }
+
+      document.getElementById("status").innerHTML = msg;
+    }
+
+    function requestRouteBySelectedDestination() {
+      if (latestLat === null || latestLon === null) {
+        document.getElementById("status").innerHTML =
+          "GPS not ready. Press Start GPS first.";
+        return;
+      }
+
+      if (selectedDestLat === null || selectedDestLon === null) {
+        document.getElementById("status").innerHTML =
+          "Please tap a destination on the map first.";
+        return;
+      }
+
+      requestRoute(latestLat, latestLon, selectedDestLat, selectedDestLon);
+    }
+
+    function requestRoute(startLat, startLon, destLat, destLon) {
+      routeRequesting = true;
+      routeLoaded = false;
+
+      resetRouteOnly();
+
+      const url =
+        SERVER_BASE_URL +
+        "/route?start_lat=" + encodeURIComponent(startLat) +
+        "&start_lon=" + encodeURIComponent(startLon) +
+        "&dest_lat=" + encodeURIComponent(destLat) +
+        "&dest_lon=" + encodeURIComponent(destLon);
+
+      document.getElementById("status").innerHTML =
+        "Requesting route from Render...";
+
+      document.getElementById("routeStatus").innerHTML =
+        "Requesting route...";
+
+      fetch(url)
+        .then(response => response.json())
+        .then(data => {
+          routeRequesting = false;
+
+          if (!data.ok) {
+            routeLoaded = false;
+
+            document.getElementById("status").innerHTML =
+              "Route failed: " + data.message;
+
+            document.getElementById("routeStatus").innerHTML =
+              "Route failed.";
+
+            return;
+          }
+
+          routePoints = data.route || [];
+          routeGeometry = data.route_geometry || [];
+          edgeInfo = data.edge_info || [];
+          startSnap = data.start_snap || null;
+          destSnap = data.dest_snap || null;
+
+          if (routePoints.length === 0) {
+            document.getElementById("status").innerHTML =
+              "Route loaded but has no points.";
+            return;
+          }
+
+          currentRouteIndex = routePoints.length > 1 ? 1 : 0;
+          lastSentIndex = -1;
+          routeLoaded = true;
+
+          const startSnapText = startSnap
+            ? "<br>Start snap: " + Number(startSnap.distance_m).toFixed(1) + " m"
+            : "";
+
+          const destSnapText = destSnap
+            ? "<br>Dest snap: " + Number(destSnap.distance_m).toFixed(1) + " m"
+            : "";
+
+          document.getElementById("routeStatus").innerHTML =
+            "Route loaded" +
+            "<br>Route points: " + routePoints.length +
+            "<br>Geometry points: " + routeGeometry.length +
+            "<br>Edges: " + edgeInfo.length +
+            startSnapText +
+            destSnapText +
+            "<br>Total cost: " + Number(data.total_cost).toFixed(2);
+
+          document.getElementById("status").innerHTML =
+            "Route loaded. Start navigation.";
+
+          drawRouteOnMap();
+          updateNextPointDisplay();
+        })
+        .catch(error => {
+          routeRequesting = false;
+          routeLoaded = false;
+
+          document.getElementById("status").innerHTML =
+            "Failed to request route.";
+
+          document.getElementById("routeStatus").innerHTML =
+            "Route request error.";
+
+          console.error(error);
+        });
+    }
+
+    function updateCurrentLocationOnMap(lat, lon) {
+      if (map === null) {
+        return;
+      }
+
+      if (currentMarker === null) {
+        currentMarker = L.marker(
+          [lat, lon],
+          { icon: makeIcon("C", "marker-current") }
+        ).addTo(map);
+        currentMarker.bindPopup("Current Location");
+        map.setView([lat, lon], 17);
+      } else {
+        currentMarker.setLatLng([lat, lon]);
+      }
+    }
+
+    function drawRouteOnMap() {
+      if (map === null || routePoints.length === 0) {
+        return;
+      }
+
+      // 穩定版：用 routePoints 畫線
+      // 這可以保證藍線一定經過每個路徑節點，也會從 S 連到 E
+      const networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
+
+      if (networkLatLngs.length === 0) {
+        return;
+      }
+
+      routeLine = L.polyline(networkLatLngs, {
+        color: "#2e86ff",
+        weight: 6,
+        opacity: 0.85
+      }).addTo(map);
+
+      drawSnapMarkers();
+      drawConnectorLines();
+      drawRouteNodeMarkers();
+
+      updateNextMarker();
+
+      const bounds = L.latLngBounds(networkLatLngs);
+
+      if (currentMarker !== null) {
+        bounds.extend(currentMarker.getLatLng());
+      }
+
+      if (destMarker !== null) {
+        bounds.extend(destMarker.getLatLng());
+      }
+
+      map.fitBounds(bounds, {
+        padding: [30, 30]
+      });
+    }
+
+    function drawSnapMarkers() {
+      let sLat = null;
+      let sLon = null;
+      let eLat = null;
+      let eLon = null;
+
+      if (startSnap) {
+        sLat = startSnap.lat;
+        sLon = startSnap.lon;
+      } else if (routePoints.length > 0) {
+        sLat = routePoints[0].lat;
+        sLon = routePoints[0].lon;
+      }
+
+      if (destSnap) {
+        eLat = destSnap.lat;
+        eLon = destSnap.lon;
+      } else if (routePoints.length > 0) {
+        const last = routePoints[routePoints.length - 1];
+        eLat = last.lat;
+        eLon = last.lon;
+      }
+
+      if (sLat !== null && sLon !== null) {
+        startSnapMarker = L.marker(
+          [sLat, sLon],
+          { icon: makeSmallIcon("S") }
+        ).addTo(map);
+
+        const snapText = startSnap
+          ? "Start snap<br>Road ID: " + startSnap.road_id +
+            "<br>Distance: " + Number(startSnap.distance_m).toFixed(1) + " m"
+          : "Start snap";
+
+        startSnapMarker.bindPopup(snapText);
+      }
+
+      if (eLat !== null && eLon !== null) {
+        destSnapMarker = L.marker(
+          [eLat, eLon],
+          { icon: makeSmallIcon("E") }
+        ).addTo(map);
+
+        const snapText = destSnap
+          ? "Destination snap<br>Road ID: " + destSnap.road_id +
+            "<br>Distance: " + Number(destSnap.distance_m).toFixed(1) + " m"
+          : "Destination snap";
+
+        destSnapMarker.bindPopup(snapText);
+      }
+    }
+
+    function drawConnectorLines() {
+      if (startSnap && latestLat !== null && latestLon !== null) {
+        startConnectorLine = L.polyline(
+          [
+            [latestLat, latestLon],
+            [startSnap.lat, startSnap.lon]
+          ],
+          {
+            color: "#f39c12",
+            weight: 4,
+            opacity: 0.8,
+            dashArray: "8,8"
+          }
+        ).addTo(map);
+      }
+
+      if (destSnap && selectedDestLat !== null && selectedDestLon !== null) {
+        destConnectorLine = L.polyline(
+          [
+            [destSnap.lat, destSnap.lon],
+            [selectedDestLat, selectedDestLon]
+          ],
+          {
+            color: "#c0392b",
+            weight: 4,
+            opacity: 0.8,
+            dashArray: "8,8"
+          }
+        ).addTo(map);
+      }
+    }
+
+    function drawRouteNodeMarkers() {
+      for (let i = 0; i < routePoints.length; i++) {
+        const p = routePoints[i];
+
+        if (p.node_id === "S" || p.node_id === "E") {
+          continue;
+        }
+
+        const label = String(i);
+
+        const marker = L.marker(
+          [p.lat, p.lon],
+          { icon: makeNodeIcon(label) }
+        ).addTo(map);
+
+        marker.bindPopup(
+          "Route index: " + i +
+          "<br>Node: " + p.node_id +
+          "<br>Raw node: " + p.raw_node_id +
+          "<br>Action: " + p.action
+        );
+
+        routePointMarkers.push(marker);
+      }
+    }
+
+    function checkRouteProgress(currentLat, currentLon) {
+      if (!routeLoaded || routePoints.length === 0) {
+        return;
+      }
+
+      if (currentRouteIndex >= routePoints.length) {
+        setArrivedState();
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      const d = distanceMeters(
+        currentLat,
+        currentLon,
+        target.lat,
+        target.lon
+      );
+
+      document.getElementById("nextPoint").innerHTML =
+        "Index: " + currentRouteIndex +
+        "<br>Node: " + target.node_id +
+        "<br>Lat: " + Number(target.lat).toFixed(8) +
+        "<br>Lon: " + Number(target.lon).toFixed(8);
+
+      document.getElementById("dist").innerHTML =
+        d.toFixed(1) + " m";
+
+      document.getElementById("action").innerHTML =
+        target.action;
+
+      if (d <= TRIGGER_DISTANCE && lastSentIndex !== currentRouteIndex) {
+        lastSentIndex = currentRouteIndex;
+
+        document.getElementById("status").innerHTML =
+          "<span class='trigger'>Trigger: " + target.action + "</span>";
+
+        sendCommandToESP32(target.action);
+
+        currentRouteIndex++;
+
+        updateNextPointDisplay();
+      } else {
+        document.getElementById("status").innerHTML =
+          "GPS updated. Navigating...";
+      }
+    }
+
+    function updateNextPointDisplay() {
+      if (!routeLoaded || routePoints.length === 0) {
+        document.getElementById("nextPoint").innerHTML =
+          "No route yet";
+
+        document.getElementById("action").innerHTML =
+          "--";
+
+        updateNextMarker();
+        return;
+      }
+
+      if (currentRouteIndex >= routePoints.length) {
+        setArrivedState();
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      document.getElementById("nextPoint").innerHTML =
+        "Index: " + currentRouteIndex +
+        "<br>Node: " + target.node_id +
+        "<br>Lat: " + Number(target.lat).toFixed(8) +
+        "<br>Lon: " + Number(target.lon).toFixed(8);
+
+      document.getElementById("action").innerHTML =
+        target.action;
+
+      updateNextMarker();
+    }
+
+    function updateNextMarker() {
+      if (map === null) {
+        return;
+      }
+
+      if (!routeLoaded || routePoints.length === 0 || currentRouteIndex >= routePoints.length) {
+        if (nextMarker !== null) {
+          map.removeLayer(nextMarker);
+          nextMarker = null;
+        }
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      if (nextMarker === null) {
+        nextMarker = L.marker(
+          [target.lat, target.lon],
+          { icon: makeIcon("N", "marker-next") }
+        ).addTo(map);
+      } else {
+        nextMarker.setLatLng([target.lat, target.lon]);
+      }
+
+      nextMarker.bindPopup(
+        "Next action: " + target.action +
+        "<br>Node: " + target.node_id +
+        "<br>Index: " + currentRouteIndex
+      );
+    }
+
+    function setArrivedState() {
+      document.getElementById("status").innerHTML =
+        "Navigation finished.";
+
+      document.getElementById("nextPoint").innerHTML =
+        "Arrived.";
+
+      document.getElementById("dist").innerHTML =
+        "--";
+
+      document.getElementById("action").innerHTML =
+        "--";
+
+      if (nextMarker !== null && map !== null) {
+        map.removeLayer(nextMarker);
+        nextMarker = null;
+      }
+    }
+
+    function resetRouteOnly() {
+      routePoints = [];
+      routeGeometry = [];
+      edgeInfo = [];
+      startSnap = null;
+      destSnap = null;
+
+      currentRouteIndex = 0;
+      routeLoaded = false;
+      routeRequesting = false;
+      lastSentIndex = -1;
+
+      clearRouteDrawing();
+
+      document.getElementById("routeStatus").innerHTML =
+        "No route yet";
+
+      document.getElementById("nextPoint").innerHTML =
+        "--";
+
+      document.getElementById("dist").innerHTML =
+        "--";
+
+      document.getElementById("action").innerHTML =
+        "--";
+    }
+
+    function resetRoute() {
+      resetRouteOnly();
+
+      document.getElementById("commandStatus").innerHTML =
+        "No command sent yet";
+
+      document.getElementById("status").innerHTML =
+        "Route reset. You can tap another destination.";
+    }
+
+    function clearRouteDrawing() {
+      const layers = [
+        routeLine,
+        startConnectorLine,
+        destConnectorLine,
+        startSnapMarker,
+        destSnapMarker,
+        nextMarker
+      ];
+
+      for (let i = 0; i < layers.length; i++) {
+        if (layers[i] !== null && map !== null) {
+          map.removeLayer(layers[i]);
+        }
+      }
+
+      routeLine = null;
+      startConnectorLine = null;
+      destConnectorLine = null;
+      startSnapMarker = null;
+      destSnapMarker = null;
+      nextMarker = null;
+
+      if (map !== null) {
+        for (let i = 0; i < routePointMarkers.length; i++) {
+          map.removeLayer(routePointMarkers[i]);
+        }
+      }
+
+      routePointMarkers = [];
+    }
+
+    function stopGPS() {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+
+      document.getElementById("status").innerHTML =
+        "GPS stopped.";
+    }
+
+    function sendCommandToESP32(action) {
+      const serverUrl =
+        SERVER_BASE_URL + "/set?dir=" + encodeURIComponent(action);
+
+      document.getElementById("commandStatus").innerHTML =
+        "Sending command: " + action;
+
+      fetch(serverUrl)
+        .then(response => response.json())
+        .then(data => {
+          if (!data.ok) {
+            document.getElementById("commandStatus").innerHTML =
+              "Command failed: " + action;
+            return;
+          }
+
+          document.getElementById("commandStatus").innerHTML =
+            "Command sent: " + action + ", seq=" + data.seq;
+        })
+        .catch(error => {
+          document.getElementById("commandStatus").innerHTML =
+            "Failed to send command.";
+
+          console.error(error);
+        });
     }
 
     function distanceMeters(lat1, lon1, lat2, lon2) {
       const R = 6371000;
+
       const phi1 = lat1 * Math.PI / 180;
       const phi2 = lat2 * Math.PI / 180;
+
       const dPhi = (lat2 - lat1) * Math.PI / 180;
       const dLambda = (lon2 - lon1) * Math.PI / 180;
 
