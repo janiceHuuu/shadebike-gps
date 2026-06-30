@@ -1,880 +1,990 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import os
-import json
-import math
-import networkx as nx
-
-app = Flask(__name__)
-CORS(app)
-
-# =========================
-# 1. ESP32 指令中繼站
-# =========================
-
-latest_cmd = {
-    "seq": 0,
-    "dir": ""
-}
-
-
-@app.route("/")
-def home():
-    return "ShadeBike command server is running."
-
-
-@app.route("/set")
-def set_command():
-    global latest_cmd
-
-    direction = request.args.get("dir", "")
-
-    if direction not in ["L", "R", "S", "A", "X"]:
-        return jsonify({
-            "ok": False,
-            "message": "Invalid direction"
-        }), 400
-
-    latest_cmd["seq"] += 1
-    latest_cmd["dir"] = direction
-
-    print(f"New command: seq={latest_cmd['seq']}, dir={latest_cmd['dir']}")
-
-    return jsonify({
-        "ok": True,
-        "seq": latest_cmd["seq"],
-        "dir": latest_cmd["dir"]
-    })
-
-
-@app.route("/get")
-def get_command():
-    return jsonify(latest_cmd)
-
-
-@app.route("/get_plain")
-def get_plain():
-    return f"{latest_cmd['seq']},{latest_cmd['dir']}"
-
-
-# =========================
-# 2. 路網資料讀取
-# =========================
-
-NODE_FILE = "node_new.geojson"
-
-ROAD_FILES = {
-    "8AM": "校內路網_8AM_完成.geojson",
-    "5PM": "校內路網_5PM_完成.geojson"
-}
-
-nodes = {}
-GRAPHS = {}
-
-START_VIRTUAL = "__start__"
-DEST_VIRTUAL = "__dest__"
-
-
-def web_mercator_to_lonlat(x, y):
-    lon = x / 20037508.34 * 180
-    lat = y / 20037508.34 * 180
-    lat = 180 / math.pi * (
-        2 * math.atan(math.exp(lat * math.pi / 180)) - math.pi / 2
-    )
-    return lon, lat
-
-
-def haversine_m(lat1, lon1, lat2, lon2):
-    R = 6371000
-
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(d_phi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    )
-
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    return R * c
-
-
-def polyline_length_m(geom):
-    total = 0.0
-
-    for i in range(len(geom) - 1):
-        total += haversine_m(
-            geom[i][0], geom[i][1],
-            geom[i + 1][0], geom[i + 1][1]
-        )
-
-    return total
-
-
-def cumulative_distances(geom):
-    cum = [0.0]
-    total = 0.0
-
-    for i in range(len(geom) - 1):
-        seg_len = haversine_m(
-            geom[i][0], geom[i][1],
-            geom[i + 1][0], geom[i + 1][1]
-        )
-        total += seg_len
-        cum.append(total)
-
-    return cum
-
-
-def point_at_distance(geom, cum, target_dist):
-    if len(geom) == 0:
-        return None
-
-    if target_dist <= 0:
-        return geom[0]
-
-    if target_dist >= cum[-1]:
-        return geom[-1]
-
-    for i in range(len(cum) - 1):
-        if cum[i] <= target_dist <= cum[i + 1]:
-            seg_len = cum[i + 1] - cum[i]
-
-            if seg_len == 0:
-                return geom[i]
-
-            t = (target_dist - cum[i]) / seg_len
-
-            lat = geom[i][0] + t * (geom[i + 1][0] - geom[i][0])
-            lon = geom[i][1] + t * (geom[i + 1][1] - geom[i][1])
-
-            return [lat, lon]
-
-    return geom[-1]
-
-
-def slice_geometry_by_distance(geom, d1, d2):
-    if not geom or len(geom) < 2:
-        return []
-
-    cum = cumulative_distances(geom)
-
-    reverse = False
-
-    if d1 > d2:
-        d1, d2 = d2, d1
-        reverse = True
-
-    d1 = max(0.0, min(d1, cum[-1]))
-    d2 = max(0.0, min(d2, cum[-1]))
-
-    start_pt = point_at_distance(geom, cum, d1)
-    end_pt = point_at_distance(geom, cum, d2)
-
-    sliced = [start_pt]
-
-    for i in range(1, len(geom) - 1):
-        if d1 < cum[i] < d2:
-            sliced.append(geom[i])
-
-    sliced.append(end_pt)
-
-    if reverse:
-        sliced = list(reversed(sliced))
-
-    return sliced
-
-
-def load_nodes():
-    global nodes
-
-    with open(NODE_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    nodes = {}
-
-    for feature in data["features"]:
-        p = feature["properties"]
-
-        node_id = int(p["FID"])
-        lon = float(p["X"])
-        lat = float(p["Y"])
-
-        nodes[node_id] = {
-            "lon": lon,
-            "lat": lat
-        }
-
-    print(f"Loaded nodes: {len(nodes)}")
-
-
-def load_road_network(time_slot, road_file):
-    G = nx.Graph()
-
-    with open(road_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    edge_count = 0
-    missing_node_edges = []
-
-    for feature in data["features"]:
-        p = feature["properties"]
-
-        road_id = int(p["FID"])
-
-        # 新版資料已經可以直接對 node_new.geojson 的 FID
-        # 不要再 -1
-        start_node = int(p["start_node"])
-        final_node = int(p["final_node"])
-
-        length_m = float(p["Shape_Leng"])
-        cost = float(p["Cost"])
-
-        if start_node not in nodes or final_node not in nodes:
-            missing_node_edges.append({
-                "road_id": road_id,
-                "start_node": start_node,
-                "final_node": final_node
-            })
-            continue
-
-        coords_3857 = feature["geometry"]["coordinates"]
-
-        geometry_lonlat = []
-
-        for coord in coords_3857:
-            x = coord[0]
-            y = coord[1]
-            lon, lat = web_mercator_to_lonlat(x, y)
-            geometry_lonlat.append([lat, lon])  # Leaflet 使用 [lat, lon]
-
-        if len(geometry_lonlat) < 2:
-            continue
-
-        # 確保 geometry 方向是 start_node -> final_node
-        start_info = nodes[start_node]
-
-        d_geom_start_to_start_node = haversine_m(
-            geometry_lonlat[0][0], geometry_lonlat[0][1],
-            start_info["lat"], start_info["lon"]
-        )
-
-        d_geom_end_to_start_node = haversine_m(
-            geometry_lonlat[-1][0], geometry_lonlat[-1][1],
-            start_info["lat"], start_info["lon"]
-        )
-
-        if d_geom_end_to_start_node < d_geom_start_to_start_node:
-            geometry_lonlat = list(reversed(geometry_lonlat))
-
-        geom_length = polyline_length_m(geometry_lonlat)
-
-        if geom_length <= 0:
-            geom_length = length_m
-
-        cost_per_m = cost / geom_length if geom_length > 0 else 1.0
-
-        # 如果同一對 start/final 已經有 edge，保留 cost 較低的那條
-        if G.has_edge(start_node, final_node):
-            old_cost = G[start_node][final_node].get("cost", float("inf"))
-
-            if old_cost <= cost:
-                continue
-
-        G.add_edge(
-            start_node,
-            final_node,
-            weight=cost,
-            road_id=road_id,
-            start_node=start_node,
-            final_node=final_node,
-            length_m=length_m,
-            geom_length_m=geom_length,
-            cost=cost,
-            cost_per_m=cost_per_m,
-            geometry=geometry_lonlat
-        )
-
-        edge_count += 1
-
-    print(f"Loaded {time_slot} road edges: {edge_count}")
-
-    if missing_node_edges:
-        print(f"Missing node edges in {time_slot}:")
-        print(missing_node_edges)
-    else:
-        print(f"{time_slot}: all road edges match node_new.geojson")
-
-    return G
-
-
-def load_all_road_networks():
-    global GRAPHS
-
-    GRAPHS = {}
-
-    for time_slot, road_file in ROAD_FILES.items():
-        if os.path.exists(road_file):
-            GRAPHS[time_slot] = load_road_network(time_slot, road_file)
-        else:
-            print(f"Road file not found for {time_slot}: {road_file}")
-
-
-# =========================
-# 3. 最近道路點投影工具
-# =========================
-
-def latlon_to_local_xy(lat, lon, lat0, lon0):
-    R = 6371000
-    x = math.radians(lon - lon0) * R * math.cos(math.radians(lat0))
-    y = math.radians(lat - lat0) * R
-    return x, y
-
-
-def local_xy_to_latlon(x, y, lat0, lon0):
-    R = 6371000
-    lat = lat0 + math.degrees(y / R)
-    lon = lon0 + math.degrees(x / (R * math.cos(math.radians(lat0))))
-    return lat, lon
-
-
-def project_point_to_segment(point_lat, point_lon, a_lat, a_lon, b_lat, b_lon):
-    lat0 = point_lat
-    lon0 = point_lon
-
-    px, py = latlon_to_local_xy(point_lat, point_lon, lat0, lon0)
-    ax, ay = latlon_to_local_xy(a_lat, a_lon, lat0, lon0)
-    bx, by = latlon_to_local_xy(b_lat, b_lon, lat0, lon0)
-
-    abx = bx - ax
-    aby = by - ay
-
-    ab_len2 = abx * abx + aby * aby
-
-    if ab_len2 == 0:
-        return {
-            "lat": a_lat,
-            "lon": a_lon,
-            "t": 0.0,
-            "distance_m": haversine_m(point_lat, point_lon, a_lat, a_lon)
-        }
-
-    apx = px - ax
-    apy = py - ay
-
-    t = (apx * abx + apy * aby) / ab_len2
-    t = max(0.0, min(1.0, t))
-
-    qx = ax + t * abx
-    qy = ay + t * aby
-
-    q_lat, q_lon = local_xy_to_latlon(qx, qy, lat0, lon0)
-
-    d = haversine_m(point_lat, point_lon, q_lat, q_lon)
-
-    return {
-        "lat": q_lat,
-        "lon": q_lon,
-        "t": t,
-        "distance_m": d
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ShadeBike GPS Navigation</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+      text-align: center;
+      background: #f4f4f4;
     }
 
+    h1 {
+      font-size: 28px;
+    }
 
-def find_nearest_point_on_edges(G, lat, lon):
-    best = None
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: 20px;
+      margin: 16px auto;
+      max-width: 430px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+    }
 
-    for u, v, data in G.edges(data=True):
-        geom = data.get("geometry", [])
+    .label {
+      font-size: 16px;
+      color: #666;
+      margin-top: 12px;
+    }
 
-        if len(geom) < 2:
-            continue
+    .value {
+      font-size: 22px;
+      font-weight: bold;
+      word-break: break-all;
+    }
 
-        cum = cumulative_distances(geom)
+    button {
+      width: 90%;
+      max-width: 430px;
+      padding: 18px;
+      font-size: 22px;
+      border: none;
+      border-radius: 16px;
+      color: white;
+      background: #2980b9;
+      margin-top: 14px;
+      cursor: pointer;
+    }
 
-        for i in range(len(geom) - 1):
-            a = geom[i]
-            b = geom[i + 1]
+    .go-btn {
+      background: #27ae60;
+    }
 
-            projection = project_point_to_segment(
-                lat, lon,
-                a[0], a[1],
-                b[0], b[1]
-            )
+    .test-btn {
+      background: #e67e22;
+    }
 
-            seg_len = haversine_m(a[0], a[1], b[0], b[1])
-            along_m = cum[i] + projection["t"] * seg_len
+    .reset-btn {
+      background: #7f8c8d;
+    }
 
-            candidate = {
-                "lat": projection["lat"],
-                "lon": projection["lon"],
-                "distance_m": projection["distance_m"],
-                "u": u,
-                "v": v,
-                "road_id": data.get("road_id"),
-                "edge_cost": data.get("cost"),
-                "edge_length_m": data.get("length_m"),
-                "geom_length_m": data.get("geom_length_m"),
-                "cost_per_m": data.get("cost_per_m"),
-                "along_m": along_m,
-                "geometry": geom
-            }
+    .stop-btn {
+      background: #c0392b;
+    }
 
-            if best is None or candidate["distance_m"] < best["distance_m"]:
-                best = candidate
+    .time-btn {
+      background: #8e44ad;
+    }
 
-    return best
+    .active-time {
+      outline: 5px solid #f1c40f;
+    }
 
+    .status {
+      font-size: 20px;
+      color: #333;
+      margin-top: 20px;
+      font-weight: bold;
+    }
 
-def add_virtual_snap_node(G_temp, virtual_id, snap):
-    lat = snap["lat"]
-    lon = snap["lon"]
+    .trigger {
+      color: #c0392b;
+      font-size: 24px;
+      font-weight: bold;
+    }
 
-    u = snap["u"]
-    v = snap["v"]
+    .hint {
+      font-size: 15px;
+      color: #666;
+      margin-top: 8px;
+      line-height: 1.5;
+    }
 
-    geom = snap["geometry"]
-    total_len = snap["geom_length_m"]
-    along = snap["along_m"]
-    cost_per_m = snap["cost_per_m"]
+    #map {
+      width: 100%;
+      max-width: 430px;
+      height: 430px;
+      margin: 16px auto;
+      border-radius: 16px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+      overflow: hidden;
+    }
 
-    G_temp.add_node(
-        virtual_id,
-        lat=lat,
-        lon=lon,
-        node_type="virtual_snap"
-    )
+    .custom-marker {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      color: white;
+      font-size: 18px;
+      font-weight: bold;
+      line-height: 34px;
+      text-align: center;
+      border: 3px solid white;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    }
 
-    dist_to_u = along
-    dist_to_v = max(0.0, total_len - along)
+    .marker-current {
+      background: #2980b9;
+    }
 
-    cost_to_u = dist_to_u * cost_per_m
-    cost_to_v = dist_to_v * cost_per_m
+    .marker-dest {
+      background: #c0392b;
+    }
 
-    geom_to_u = slice_geometry_by_distance(geom, along, 0.0)
-    geom_to_v = slice_geometry_by_distance(geom, along, total_len)
+    .marker-next {
+      background: #27ae60;
+    }
 
-    if len(geom_to_u) < 2:
-        geom_to_u = [[lat, lon], [nodes[u]["lat"], nodes[u]["lon"]]]
+    .marker-snap {
+      background: #7f8c8d;
+      width: 26px;
+      height: 26px;
+      line-height: 26px;
+      font-size: 14px;
+    }
 
-    if len(geom_to_v) < 2:
-        geom_to_v = [[lat, lon], [nodes[v]["lat"], nodes[v]["lon"]]]
+    .node-label {
+      background: #2e86ff;
+      color: white;
+      border: 2px solid white;
+      border-radius: 50%;
+      width: 22px;
+      height: 22px;
+      line-height: 22px;
+      text-align: center;
+      font-size: 11px;
+      font-weight: bold;
+      box-shadow: 0 1px 5px rgba(0,0,0,0.35);
+    }
+  </style>
+</head>
 
-    G_temp.add_edge(
-        virtual_id,
-        u,
-        weight=cost_to_u,
-        cost=cost_to_u,
-        length_m=dist_to_u,
-        road_id=snap["road_id"],
-        geometry=geom_to_u,
-        edge_type="virtual_to_u"
-    )
+<body>
+  <h1>ShadeBike GPS Navigation</h1>
 
-    G_temp.add_edge(
-        virtual_id,
-        v,
-        weight=cost_to_v,
-        cost=cost_to_v,
-        length_m=dist_to_v,
-        road_id=snap["road_id"],
-        geometry=geom_to_v,
-        edge_type="virtual_to_v"
-    )
+  <button onclick="startGPS()">Start GPS</button>
 
+  <button id="btn8AM" class="time-btn active-time" onclick="setTimeSlot('8AM')">Use 8AM Route</button>
+  <button id="btn5PM" class="time-btn" onclick="setTimeSlot('5PM')">Use 5PM Route</button>
 
-def add_direct_snap_edge_if_same_road(G_temp, start_snap, dest_snap):
-    same_edge = (
-        start_snap["road_id"] == dest_snap["road_id"]
-        and {start_snap["u"], start_snap["v"]} == {dest_snap["u"], dest_snap["v"]}
-    )
+  <button class="go-btn" onclick="requestRouteBySelectedDestination()">Go to Selected Point</button>
 
-    if not same_edge:
-        return
+  <button class="test-btn" onclick="sendCommandToESP32('R')">Test Send R to ESP32</button>
+  <button class="test-btn" onclick="sendCommandToESP32('L')">Test Send L to ESP32</button>
+  <button class="test-btn" onclick="sendCommandToESP32('A')">Test Send A to ESP32</button>
 
-    geom = start_snap["geometry"]
-    cost_per_m = start_snap["cost_per_m"]
+  <button class="reset-btn" onclick="resetRoute()">Reset Route</button>
+  <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
 
-    d1 = start_snap["along_m"]
-    d2 = dest_snap["along_m"]
+  <div class="hint">
+    先按 Start GPS，等目前位置出現後，在地圖上點目的地，選 8AM 或 5PM，再按 Go to Selected Point。
+  </div>
 
-    direct_geom = slice_geometry_by_distance(geom, d1, d2)
-    direct_len = abs(d2 - d1)
+  <div id="map"></div>
 
-    if len(direct_geom) < 2:
-        direct_geom = [
-            [start_snap["lat"], start_snap["lon"]],
-            [dest_snap["lat"], dest_snap["lon"]]
-        ]
+  <div class="card">
+    <div class="label">Current Time Slot</div>
+    <div class="value" id="timeSlotDisplay">8AM</div>
 
-    direct_cost = direct_len * cost_per_m
+    <div class="label">Current Latitude</div>
+    <div class="value" id="lat">--</div>
 
-    G_temp.add_edge(
-        START_VIRTUAL,
-        DEST_VIRTUAL,
-        weight=direct_cost,
-        cost=direct_cost,
-        length_m=direct_len,
-        road_id=start_snap["road_id"],
-        geometry=direct_geom,
-        edge_type="virtual_direct_same_edge"
-    )
+    <div class="label">Current Longitude</div>
+    <div class="value" id="lon">--</div>
 
+    <div class="label">Accuracy</div>
+    <div class="value" id="acc">--</div>
+  </div>
 
-# =========================
-# 4. 路徑輸出工具
-# =========================
+  <div class="card">
+    <div class="label">Selected Destination</div>
+    <div class="value" id="dest">尚未選擇</div>
 
-def get_node_position(G, node_id):
-    if node_id in G.nodes:
-        data = G.nodes[node_id]
-        return data["lat"], data["lon"]
+    <div class="label">Trigger Radius</div>
+    <div class="value" id="radius">20 m</div>
+  </div>
 
-    if isinstance(node_id, int) and node_id in nodes:
-        return nodes[node_id]["lat"], nodes[node_id]["lon"]
+  <div class="card">
+    <div class="label">Route Status</div>
+    <div class="value" id="routeStatus">No route yet</div>
 
-    raise KeyError(f"Node position not found: {node_id}")
+    <div class="label">Next Navigation Point</div>
+    <div class="value" id="nextPoint">--</div>
 
+    <div class="label">Distance to Next Point</div>
+    <div class="value" id="dist">--</div>
 
-def bearing_deg(lat1, lon1, lat2, lon2):
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    d_lon = math.radians(lon2 - lon1)
+    <div class="label">Next Action</div>
+    <div class="value" id="action">--</div>
+  </div>
 
-    y = math.sin(d_lon) * math.cos(phi2)
-    x = (
-        math.cos(phi1) * math.sin(phi2)
-        - math.sin(phi1) * math.cos(phi2) * math.cos(d_lon)
-    )
+  <div class="card">
+    <div class="label">Command Status</div>
+    <div class="value" id="commandStatus">No command sent yet</div>
+  </div>
 
-    brng = math.degrees(math.atan2(y, x))
-    return (brng + 360) % 360
+  <div class="status" id="status">Press Start GPS</div>
 
+  <script>
+    const SERVER_BASE_URL = "https://shadebike-server.onrender.com";
 
-def angle_diff_deg(a, b):
-    diff = (b - a + 540) % 360 - 180
-    return diff
+    const TRIGGER_DISTANCE = 20;
 
+    const DEFAULT_CENTER_LAT = 23.0015;
+    const DEFAULT_CENTER_LON = 120.2190;
 
-def decide_action_by_coords(prev_pt, curr_pt, next_pt):
-    b1 = bearing_deg(
-        prev_pt["lat"], prev_pt["lon"],
-        curr_pt["lat"], curr_pt["lon"]
-    )
+    let selectedTimeSlot = "8AM";
 
-    b2 = bearing_deg(
-        curr_pt["lat"], curr_pt["lon"],
-        next_pt["lat"], next_pt["lon"]
-    )
+    let watchId = null;
 
-    diff = angle_diff_deg(b1, b2)
+    let latestLat = null;
+    let latestLon = null;
+    let latestAcc = null;
 
-    if diff > 35:
-        return "R"
-    elif diff < -35:
-        return "L"
-    else:
-        return "S"
+    let selectedDestLat = null;
+    let selectedDestLon = null;
 
+    let routePoints = [];
+    let routeGeometry = [];
+    let edgeInfo = [];
+    let startSnap = null;
+    let destSnap = null;
 
-def build_route_points(G_temp, path):
-    route = []
-    temp_points = []
+    let currentRouteIndex = 0;
+    let routeLoaded = false;
+    let routeRequesting = false;
+    let lastSentIndex = -1;
 
-    for node_id in path:
-        lat, lon = get_node_position(G_temp, node_id)
+    let map = null;
 
-        if node_id == START_VIRTUAL:
-            label = "S"
-        elif node_id == DEST_VIRTUAL:
-            label = "E"
-        else:
-            label = str(node_id)
+    let currentMarker = null;
+    let destMarker = null;
+    let startSnapMarker = null;
+    let destSnapMarker = null;
+    let nextMarker = null;
 
-        temp_points.append({
-            "node_id": label,
-            "raw_node_id": str(node_id),
-            "lat": lat,
-            "lon": lon
+    let routeLine = null;
+    let nodePathLine = null;
+    let startConnectorLine = null;
+    let destConnectorLine = null;
+
+    let routePointMarkers = [];
+
+    function setTimeSlot(slot) {
+      selectedTimeSlot = slot;
+
+      document.getElementById("timeSlotDisplay").innerHTML = selectedTimeSlot;
+
+      const btn8 = document.getElementById("btn8AM");
+      const btn5 = document.getElementById("btn5PM");
+
+      if (slot === "8AM") {
+        btn8.classList.add("active-time");
+        btn5.classList.remove("active-time");
+      } else {
+        btn5.classList.add("active-time");
+        btn8.classList.remove("active-time");
+      }
+
+      resetRouteOnly();
+
+      document.getElementById("status").innerHTML =
+        "Time slot changed to " + selectedTimeSlot + ". Press Go to Selected Point again.";
+    }
+
+    function makeIcon(text, className) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='custom-marker " + className + "'>" + text + "</div>",
+        iconSize: [34, 34],
+        iconAnchor: [17, 17]
+      });
+    }
+
+    function makeSmallIcon(text) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='custom-marker marker-snap'>" + text + "</div>",
+        iconSize: [26, 26],
+        iconAnchor: [13, 13]
+      });
+    }
+
+    function makeNodeIcon(text) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='node-label'>" + text + "</div>",
+        iconSize: [22, 22],
+        iconAnchor: [11, 11]
+      });
+    }
+
+    function initMap() {
+      if (map !== null) {
+        return;
+      }
+
+      map = L.map("map").setView([DEFAULT_CENTER_LAT, DEFAULT_CENTER_LON], 16);
+
+      L.tileLayer(
+        "https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        {
+          maxZoom: 19,
+          attribution: "Tiles © Esri"
+        }
+      ).addTo(map);
+
+      map.on("click", function(e) {
+        setDestination(e.latlng.lat, e.latlng.lng);
+      });
+    }
+
+    window.addEventListener("load", function() {
+      initMap();
+    });
+
+    function setDestination(lat, lon) {
+      selectedDestLat = lat;
+      selectedDestLon = lon;
+
+      document.getElementById("dest").innerHTML =
+        lat.toFixed(8) + ", " + lon.toFixed(8);
+
+      if (destMarker === null) {
+        destMarker = L.marker(
+          [lat, lon],
+          { icon: makeIcon("D", "marker-dest") }
+        ).addTo(map);
+      } else {
+        destMarker.setLatLng([lat, lon]);
+      }
+
+      destMarker.bindPopup("Selected Destination").openPopup();
+
+      resetRouteOnly();
+
+      document.getElementById("status").innerHTML =
+        "Destination selected. Press Go to Selected Point.";
+    }
+
+    function startGPS() {
+      initMap();
+
+      if (!navigator.geolocation) {
+        document.getElementById("status").innerHTML =
+          "This browser does not support GPS.";
+        return;
+      }
+
+      if (watchId !== null) {
+        document.getElementById("status").innerHTML =
+          "GPS is already running.";
+        return;
+      }
+
+      document.getElementById("status").innerHTML =
+        "Requesting GPS permission...";
+
+      watchId = navigator.geolocation.watchPosition(
+        handlePosition,
+        handleGPSError,
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 0
+        }
+      );
+    }
+
+    function handlePosition(position) {
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+      const acc = position.coords.accuracy;
+
+      latestLat = lat;
+      latestLon = lon;
+      latestAcc = acc;
+
+      document.getElementById("lat").innerHTML = lat.toFixed(8);
+      document.getElementById("lon").innerHTML = lon.toFixed(8);
+      document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
+
+      updateCurrentLocationOnMap(lat, lon);
+
+      if (!routeLoaded && !routeRequesting) {
+        if (selectedDestLat === null || selectedDestLon === null) {
+          document.getElementById("status").innerHTML =
+            "GPS ready. Tap a destination on the map.";
+          return;
+        }
+      }
+
+      if (routeLoaded) {
+        checkRouteProgress(lat, lon);
+      }
+    }
+
+    function handleGPSError(error) {
+      let msg = "";
+
+      if (error.code === 1) {
+        msg = "Permission denied. Please allow location access.";
+      } else if (error.code === 2) {
+        msg = "Position unavailable.";
+      } else if (error.code === 3) {
+        msg = "GPS timeout.";
+      } else {
+        msg = "Unknown GPS error.";
+      }
+
+      document.getElementById("status").innerHTML = msg;
+    }
+
+    function requestRouteBySelectedDestination() {
+      if (latestLat === null || latestLon === null) {
+        document.getElementById("status").innerHTML =
+          "GPS not ready. Press Start GPS first.";
+        return;
+      }
+
+      if (selectedDestLat === null || selectedDestLon === null) {
+        document.getElementById("status").innerHTML =
+          "Please tap a destination on the map first.";
+        return;
+      }
+
+      requestRoute(latestLat, latestLon, selectedDestLat, selectedDestLon);
+    }
+
+    function requestRoute(startLat, startLon, destLat, destLon) {
+      routeRequesting = true;
+      routeLoaded = false;
+
+      resetRouteOnly();
+
+      const url =
+        SERVER_BASE_URL +
+        "/route?start_lat=" + encodeURIComponent(startLat) +
+        "&start_lon=" + encodeURIComponent(startLon) +
+        "&dest_lat=" + encodeURIComponent(destLat) +
+        "&dest_lon=" + encodeURIComponent(destLon) +
+        "&time_slot=" + encodeURIComponent(selectedTimeSlot);
+
+      document.getElementById("status").innerHTML =
+        "Requesting " + selectedTimeSlot + " route from Render...";
+
+      document.getElementById("routeStatus").innerHTML =
+        "Requesting route...";
+
+      fetch(url)
+        .then(response => response.json())
+        .then(data => {
+          routeRequesting = false;
+
+          if (!data.ok) {
+            routeLoaded = false;
+
+            document.getElementById("status").innerHTML =
+              "Route failed: " + data.message;
+
+            document.getElementById("routeStatus").innerHTML =
+              "Route failed.";
+
+            return;
+          }
+
+          routePoints = data.route || [];
+          routeGeometry = data.route_geometry || [];
+          edgeInfo = data.edge_info || [];
+          startSnap = data.start_snap || null;
+          destSnap = data.dest_snap || null;
+
+          if (routePoints.length === 0) {
+            document.getElementById("status").innerHTML =
+              "Route loaded but has no points.";
+            return;
+          }
+
+          currentRouteIndex = routePoints.length > 1 ? 1 : 0;
+          lastSentIndex = -1;
+          routeLoaded = true;
+
+          const startSnapText = startSnap
+            ? "<br>Start snap: " + Number(startSnap.distance_m).toFixed(1) + " m"
+            : "";
+
+          const destSnapText = destSnap
+            ? "<br>Dest snap: " + Number(destSnap.distance_m).toFixed(1) + " m"
+            : "";
+
+          document.getElementById("routeStatus").innerHTML =
+            "Route loaded: " + data.time_slot +
+            "<br>Route points: " + routePoints.length +
+            "<br>Geometry points: " + routeGeometry.length +
+            "<br>Edges: " + edgeInfo.length +
+            startSnapText +
+            destSnapText +
+            "<br>Total cost: " + Number(data.total_cost).toFixed(2);
+
+          document.getElementById("status").innerHTML =
+            data.time_slot + " route loaded. Start navigation.";
+
+          drawRouteOnMap();
+          updateNextPointDisplay();
         })
+        .catch(error => {
+          routeRequesting = false;
+          routeLoaded = false;
 
-    for i, point in enumerate(temp_points):
-        if i == 0:
-            action = "S"
-        elif i == len(temp_points) - 1:
-            action = "A"
-        else:
-            action = decide_action_by_coords(
-                temp_points[i - 1],
-                temp_points[i],
-                temp_points[i + 1]
-            )
+          document.getElementById("status").innerHTML =
+            "Failed to request route.";
 
-        route.append({
-            "node_id": point["node_id"],
-            "raw_node_id": point["raw_node_id"],
-            "lat": point["lat"],
-            "lon": point["lon"],
-            "action": action
+          document.getElementById("routeStatus").innerHTML =
+            "Route request error.";
+
+          console.error(error);
+        });
+    }
+
+    function updateCurrentLocationOnMap(lat, lon) {
+      if (map === null) {
+        return;
+      }
+
+      if (currentMarker === null) {
+        currentMarker = L.marker(
+          [lat, lon],
+          { icon: makeIcon("C", "marker-current") }
+        ).addTo(map);
+        currentMarker.bindPopup("Current Location");
+        map.setView([lat, lon], 17);
+      } else {
+        currentMarker.setLatLng([lat, lon]);
+      }
+    }
+
+    function drawRouteOnMap() {
+      if (map === null || routePoints.length === 0) {
+        return;
+      }
+
+      const nodeLatLngs = routePoints.map(p => [p.lat, p.lon]);
+
+      let roadLatLngs = [];
+
+      if (routeGeometry && routeGeometry.length > 0) {
+        roadLatLngs = routeGeometry;
+      } else {
+        roadLatLngs = nodeLatLngs;
+      }
+
+      if (roadLatLngs.length === 0) {
+        return;
+      }
+
+      // 藍色實線：真正沿道路 geometry 的路線
+      routeLine = L.polyline(roadLatLngs, {
+        color: "#2e86ff",
+        weight: 6,
+        opacity: 0.85
+      }).addTo(map);
+
+      // 灰色虛線：節點連線，用來檢查路徑節點順序
+      nodePathLine = L.polyline(nodeLatLngs, {
+        color: "#555555",
+        weight: 3,
+        opacity: 0.65,
+        dashArray: "6,8"
+      }).addTo(map);
+
+      drawSnapMarkers();
+      drawConnectorLines();
+      drawRouteNodeMarkers();
+
+      updateNextMarker();
+
+      const bounds = L.latLngBounds(roadLatLngs);
+
+      for (let i = 0; i < nodeLatLngs.length; i++) {
+        bounds.extend(nodeLatLngs[i]);
+      }
+
+      if (currentMarker !== null) {
+        bounds.extend(currentMarker.getLatLng());
+      }
+
+      if (destMarker !== null) {
+        bounds.extend(destMarker.getLatLng());
+      }
+
+      map.fitBounds(bounds, {
+        padding: [30, 30]
+      });
+    }
+
+    function drawSnapMarkers() {
+      let sLat = null;
+      let sLon = null;
+      let eLat = null;
+      let eLon = null;
+
+      if (startSnap) {
+        sLat = startSnap.lat;
+        sLon = startSnap.lon;
+      } else if (routePoints.length > 0) {
+        sLat = routePoints[0].lat;
+        sLon = routePoints[0].lon;
+      }
+
+      if (destSnap) {
+        eLat = destSnap.lat;
+        eLon = destSnap.lon;
+      } else if (routePoints.length > 0) {
+        const last = routePoints[routePoints.length - 1];
+        eLat = last.lat;
+        eLon = last.lon;
+      }
+
+      if (sLat !== null && sLon !== null) {
+        startSnapMarker = L.marker(
+          [sLat, sLon],
+          { icon: makeSmallIcon("S") }
+        ).addTo(map);
+
+        const snapText = startSnap
+          ? "Start snap<br>Road ID: " + startSnap.road_id +
+            "<br>Distance: " + Number(startSnap.distance_m).toFixed(1) + " m"
+          : "Start snap";
+
+        startSnapMarker.bindPopup(snapText);
+      }
+
+      if (eLat !== null && eLon !== null) {
+        destSnapMarker = L.marker(
+          [eLat, eLon],
+          { icon: makeSmallIcon("E") }
+        ).addTo(map);
+
+        const snapText = destSnap
+          ? "Destination snap<br>Road ID: " + destSnap.road_id +
+            "<br>Distance: " + Number(destSnap.distance_m).toFixed(1) + " m"
+          : "Destination snap";
+
+        destSnapMarker.bindPopup(snapText);
+      }
+    }
+
+    function drawConnectorLines() {
+      if (startSnap && latestLat !== null && latestLon !== null) {
+        startConnectorLine = L.polyline(
+          [
+            [latestLat, latestLon],
+            [startSnap.lat, startSnap.lon]
+          ],
+          {
+            color: "#f39c12",
+            weight: 4,
+            opacity: 0.8,
+            dashArray: "8,8"
+          }
+        ).addTo(map);
+      }
+
+      if (destSnap && selectedDestLat !== null && selectedDestLon !== null) {
+        destConnectorLine = L.polyline(
+          [
+            [destSnap.lat, destSnap.lon],
+            [selectedDestLat, selectedDestLon]
+          ],
+          {
+            color: "#c0392b",
+            weight: 4,
+            opacity: 0.8,
+            dashArray: "8,8"
+          }
+        ).addTo(map);
+      }
+    }
+
+    function drawRouteNodeMarkers() {
+      for (let i = 0; i < routePoints.length; i++) {
+        const p = routePoints[i];
+
+        if (p.node_id === "S" || p.node_id === "E") {
+          continue;
+        }
+
+        const label = String(i);
+
+        const marker = L.marker(
+          [p.lat, p.lon],
+          { icon: makeNodeIcon(label) }
+        ).addTo(map);
+
+        marker.bindPopup(
+          "Route index: " + i +
+          "<br>Node: " + p.node_id +
+          "<br>Raw node: " + p.raw_node_id +
+          "<br>Action: " + p.action
+        );
+
+        routePointMarkers.push(marker);
+      }
+    }
+
+    function checkRouteProgress(currentLat, currentLon) {
+      if (!routeLoaded || routePoints.length === 0) {
+        return;
+      }
+
+      if (currentRouteIndex >= routePoints.length) {
+        setArrivedState();
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      const d = distanceMeters(
+        currentLat,
+        currentLon,
+        target.lat,
+        target.lon
+      );
+
+      document.getElementById("nextPoint").innerHTML =
+        "Index: " + currentRouteIndex +
+        "<br>Node: " + target.node_id +
+        "<br>Lat: " + Number(target.lat).toFixed(8) +
+        "<br>Lon: " + Number(target.lon).toFixed(8);
+
+      document.getElementById("dist").innerHTML =
+        d.toFixed(1) + " m";
+
+      document.getElementById("action").innerHTML =
+        target.action;
+
+      if (d <= TRIGGER_DISTANCE && lastSentIndex !== currentRouteIndex) {
+        lastSentIndex = currentRouteIndex;
+
+        document.getElementById("status").innerHTML =
+          "<span class='trigger'>Trigger: " + target.action + "</span>";
+
+        sendCommandToESP32(target.action);
+
+        currentRouteIndex++;
+
+        updateNextPointDisplay();
+      } else {
+        document.getElementById("status").innerHTML =
+          "GPS updated. Navigating...";
+      }
+    }
+
+    function updateNextPointDisplay() {
+      if (!routeLoaded || routePoints.length === 0) {
+        document.getElementById("nextPoint").innerHTML =
+          "No route yet";
+
+        document.getElementById("action").innerHTML =
+          "--";
+
+        updateNextMarker();
+        return;
+      }
+
+      if (currentRouteIndex >= routePoints.length) {
+        setArrivedState();
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      document.getElementById("nextPoint").innerHTML =
+        "Index: " + currentRouteIndex +
+        "<br>Node: " + target.node_id +
+        "<br>Lat: " + Number(target.lat).toFixed(8) +
+        "<br>Lon: " + Number(target.lon).toFixed(8);
+
+      document.getElementById("action").innerHTML =
+        target.action;
+
+      updateNextMarker();
+    }
+
+    function updateNextMarker() {
+      if (map === null) {
+        return;
+      }
+
+      if (!routeLoaded || routePoints.length === 0 || currentRouteIndex >= routePoints.length) {
+        if (nextMarker !== null) {
+          map.removeLayer(nextMarker);
+          nextMarker = null;
+        }
+        return;
+      }
+
+      const target = routePoints[currentRouteIndex];
+
+      if (nextMarker === null) {
+        nextMarker = L.marker(
+          [target.lat, target.lon],
+          { icon: makeIcon("N", "marker-next") }
+        ).addTo(map);
+      } else {
+        nextMarker.setLatLng([target.lat, target.lon]);
+      }
+
+      nextMarker.bindPopup(
+        "Next action: " + target.action +
+        "<br>Node: " + target.node_id +
+        "<br>Index: " + currentRouteIndex
+      );
+    }
+
+    function setArrivedState() {
+      document.getElementById("status").innerHTML =
+        "Navigation finished.";
+
+      document.getElementById("nextPoint").innerHTML =
+        "Arrived.";
+
+      document.getElementById("dist").innerHTML =
+        "--";
+
+      document.getElementById("action").innerHTML =
+        "--";
+
+      if (nextMarker !== null && map !== null) {
+        map.removeLayer(nextMarker);
+        nextMarker = null;
+      }
+    }
+
+    function resetRouteOnly() {
+      routePoints = [];
+      routeGeometry = [];
+      edgeInfo = [];
+      startSnap = null;
+      destSnap = null;
+
+      currentRouteIndex = 0;
+      routeLoaded = false;
+      routeRequesting = false;
+      lastSentIndex = -1;
+
+      clearRouteDrawing();
+
+      document.getElementById("routeStatus").innerHTML =
+        "No route yet";
+
+      document.getElementById("nextPoint").innerHTML =
+        "--";
+
+      document.getElementById("dist").innerHTML =
+        "--";
+
+      document.getElementById("action").innerHTML =
+        "--";
+    }
+
+    function resetRoute() {
+      resetRouteOnly();
+
+      document.getElementById("commandStatus").innerHTML =
+        "No command sent yet";
+
+      document.getElementById("status").innerHTML =
+        "Route reset. You can tap another destination.";
+    }
+
+    function clearRouteDrawing() {
+      const layers = [
+        routeLine,
+        nodePathLine,
+        startConnectorLine,
+        destConnectorLine,
+        startSnapMarker,
+        destSnapMarker,
+        nextMarker
+      ];
+
+      for (let i = 0; i < layers.length; i++) {
+        if (layers[i] !== null && map !== null) {
+          map.removeLayer(layers[i]);
+        }
+      }
+
+      routeLine = null;
+      nodePathLine = null;
+      startConnectorLine = null;
+      destConnectorLine = null;
+      startSnapMarker = null;
+      destSnapMarker = null;
+      nextMarker = null;
+
+      if (map !== null) {
+        for (let i = 0; i < routePointMarkers.length; i++) {
+          map.removeLayer(routePointMarkers[i]);
+        }
+      }
+
+      routePointMarkers = [];
+    }
+
+    function stopGPS() {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+
+      document.getElementById("status").innerHTML =
+        "GPS stopped.";
+    }
+
+    function sendCommandToESP32(action) {
+      const serverUrl =
+        SERVER_BASE_URL + "/set?dir=" + encodeURIComponent(action);
+
+      document.getElementById("commandStatus").innerHTML =
+        "Sending command: " + action;
+
+      fetch(serverUrl)
+        .then(response => response.json())
+        .then(data => {
+          if (!data.ok) {
+            document.getElementById("commandStatus").innerHTML =
+              "Command failed: " + action;
+            return;
+          }
+
+          document.getElementById("commandStatus").innerHTML =
+            "Command sent: " + action + ", seq=" + data.seq;
         })
+        .catch(error => {
+          document.getElementById("commandStatus").innerHTML =
+            "Failed to send command.";
 
-    return route
+          console.error(error);
+        });
+    }
 
+    function distanceMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
 
-def build_route_geometry_from_temp_graph(G_temp, path):
-    full_geometry = []
+      const phi1 = lat1 * Math.PI / 180;
+      const phi2 = lat2 * Math.PI / 180;
 
-    for i in range(len(path) - 1):
-        u = path[i]
-        v = path[i + 1]
+      const dPhi = (lat2 - lat1) * Math.PI / 180;
+      const dLambda = (lon2 - lon1) * Math.PI / 180;
 
-        edge_data = G_temp.get_edge_data(u, v)
+      const a =
+        Math.sin(dPhi / 2) * Math.sin(dPhi / 2) +
+        Math.cos(phi1) * Math.cos(phi2) *
+        Math.sin(dLambda / 2) * Math.sin(dLambda / 2);
 
-        if edge_data is None:
-            continue
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
-        geom = edge_data.get("geometry", [])
-
-        if not geom:
-            continue
-
-        # 確保 geometry 方向是 u -> v
-        u_lat, u_lon = get_node_position(G_temp, u)
-
-        d_start_to_u = haversine_m(
-            geom[0][0], geom[0][1],
-            u_lat, u_lon
-        )
-
-        d_end_to_u = haversine_m(
-            geom[-1][0], geom[-1][1],
-            u_lat, u_lon
-        )
-
-        if d_end_to_u < d_start_to_u:
-            geom = list(reversed(geom))
-
-        if len(full_geometry) > 0:
-            full_geometry.extend(geom[1:])
-        else:
-            full_geometry.extend(geom)
-
-    return full_geometry
-
-
-def trim_route_geometry_to_start_end(route_geometry, start_snap, dest_snap):
-    if not route_geometry or len(route_geometry) < 2:
-        return route_geometry
-
-    start_pt = [start_snap["lat"], start_snap["lon"]]
-    end_pt = [dest_snap["lat"], dest_snap["lon"]]
-
-    start_index = 0
-    start_min_dist = float("inf")
-
-    end_index = len(route_geometry) - 1
-    end_min_dist = float("inf")
-
-    for i, pt in enumerate(route_geometry):
-        d_start = haversine_m(
-            pt[0], pt[1],
-            start_snap["lat"], start_snap["lon"]
-        )
-
-        d_end = haversine_m(
-            pt[0], pt[1],
-            dest_snap["lat"], dest_snap["lon"]
-        )
-
-        if d_start < start_min_dist:
-            start_min_dist = d_start
-            start_index = i
-
-        if d_end < end_min_dist:
-            end_min_dist = d_end
-            end_index = i
-
-    if start_index <= end_index:
-        trimmed = route_geometry[start_index:end_index + 1]
-    else:
-        trimmed = list(reversed(route_geometry[end_index:start_index + 1]))
-
-    if len(trimmed) < 2:
-        trimmed = [start_pt, end_pt]
-    else:
-        trimmed[0] = start_pt
-        trimmed[-1] = end_pt
-
-    return trimmed
-
-
-def build_edge_info(G_temp, path):
-    edge_info = []
-
-    for i in range(len(path) - 1):
-        u = path[i]
-        v = path[i + 1]
-
-        e = G_temp.get_edge_data(u, v)
-
-        if not e:
-            continue
-
-        edge_info.append({
-            "from": str(u),
-            "to": str(v),
-            "road_id": e.get("road_id"),
-            "length_m": e.get("length_m"),
-            "cost": e.get("cost"),
-            "edge_type": e.get("edge_type", "normal")
-        })
-
-    return edge_info
-
-
-# =========================
-# 5. /route API
-# =========================
-
-@app.route("/route")
-def route():
-    try:
-        start_lat = float(request.args.get("start_lat"))
-        start_lon = float(request.args.get("start_lon"))
-        dest_lat = float(request.args.get("dest_lat"))
-        dest_lon = float(request.args.get("dest_lon"))
-    except:
-        return jsonify({
-            "ok": False,
-            "message": "Missing or invalid parameters. Use start_lat, start_lon, dest_lat, dest_lon."
-        }), 400
-
-    time_slot = request.args.get("time_slot", "8AM").upper()
-
-    if time_slot not in GRAPHS:
-        return jsonify({
-            "ok": False,
-            "message": f"Invalid or unavailable time_slot: {time_slot}. Use 8AM or 5PM.",
-            "available_time_slots": list(GRAPHS.keys())
-        }), 400
-
-    G_base = GRAPHS[time_slot]
-
-    start_snap = find_nearest_point_on_edges(G_base, start_lat, start_lon)
-    dest_snap = find_nearest_point_on_edges(G_base, dest_lat, dest_lon)
-
-    if start_snap is None or dest_snap is None:
-        return jsonify({
-            "ok": False,
-            "message": "Could not snap start or destination to road network."
-        }), 400
-
-    G_temp = G_base.copy()
-
-    # 把原本 nodes 座標加進 graph node attributes
-    for node_id, info in nodes.items():
-        if node_id in G_temp.nodes:
-            G_temp.nodes[node_id]["lat"] = info["lat"]
-            G_temp.nodes[node_id]["lon"] = info["lon"]
-            G_temp.nodes[node_id]["node_type"] = "real_node"
-
-    add_virtual_snap_node(G_temp, START_VIRTUAL, start_snap)
-    add_virtual_snap_node(G_temp, DEST_VIRTUAL, dest_snap)
-    add_direct_snap_edge_if_same_road(G_temp, start_snap, dest_snap)
-
-    try:
-        path = nx.shortest_path(
-            G_temp,
-            source=START_VIRTUAL,
-            target=DEST_VIRTUAL,
-            weight="weight"
-        )
-
-        total_cost = nx.shortest_path_length(
-            G_temp,
-            source=START_VIRTUAL,
-            target=DEST_VIRTUAL,
-            weight="weight"
-        )
-
-    except nx.NetworkXNoPath:
-        return jsonify({
-            "ok": False,
-            "message": "No path found between start snap and destination snap.",
-            "time_slot": time_slot,
-            "start_snap": {
-                "lat": start_snap["lat"],
-                "lon": start_snap["lon"],
-                "distance_m": start_snap["distance_m"],
-                "road_id": start_snap["road_id"],
-                "edge_u": start_snap["u"],
-                "edge_v": start_snap["v"]
-            },
-            "dest_snap": {
-                "lat": dest_snap["lat"],
-                "lon": dest_snap["lon"],
-                "distance_m": dest_snap["distance_m"],
-                "road_id": dest_snap["road_id"],
-                "edge_u": dest_snap["u"],
-                "edge_v": dest_snap["v"]
-            }
-        }), 400
-
-    route_points = build_route_points(G_temp, path)
-    route_geometry = build_route_geometry_from_temp_graph(G_temp, path)
-
-    # 重要：裁切 route_geometry，避免藍線超過 S 或 E
-    route_geometry = trim_route_geometry_to_start_end(
-        route_geometry,
-        start_snap,
-        dest_snap
-    )
-
-    edge_info = build_edge_info(G_temp, path)
-
-    return jsonify({
-        "ok": True,
-        "time_slot": time_slot,
-
-        "start_snap": {
-            "lat": start_snap["lat"],
-            "lon": start_snap["lon"],
-            "distance_m": start_snap["distance_m"],
-            "road_id": start_snap["road_id"],
-            "edge_u": start_snap["u"],
-            "edge_v": start_snap["v"],
-            "along_m": start_snap["along_m"]
-        },
-
-        "dest_snap": {
-            "lat": dest_snap["lat"],
-            "lon": dest_snap["lon"],
-            "distance_m": dest_snap["distance_m"],
-            "road_id": dest_snap["road_id"],
-            "edge_u": dest_snap["u"],
-            "edge_v": dest_snap["v"],
-            "along_m": dest_snap["along_m"]
-        },
-
-        "node_path": [str(n) for n in path],
-        "total_cost": total_cost,
-        "route": route_points,
-        "route_geometry": route_geometry,
-        "edge_info": edge_info
-    })
-
-
-# =========================
-# 6. 啟動時讀取資料
-# =========================
-
-load_nodes()
-load_all_road_networks()
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5050))
-    app.run(host="0.0.0.0", port=port)
+      return R * c;
+    }
+  </script>
+</body>
+</html>
