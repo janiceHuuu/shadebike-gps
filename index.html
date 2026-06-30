@@ -167,17 +167,25 @@
     let nextMarker = null;
     let routePointMarkers = [];
 
-    function initMap() {
-      if (map !== null) {
-        return;
+      function initMap() {
+        if (map !== null) {
+          return;
+        }
+      
+        map = L.map("map").setView([DEST_LAT, DEST_LON], 16);
+      
+        // ArcGIS Pro 使用的 Topographic / World_Topo_Map 底圖
+        L.tileLayer(
+          "https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+          {
+            maxZoom: 19,
+            attribution: "Tiles © Esri"
+          }
+        ).addTo(map);
+      
+        destMarker = L.marker([DEST_LAT, DEST_LON]).addTo(map);
+        destMarker.bindPopup("Destination");
       }
-
-      map = L.map("map").setView([DEST_LAT, DEST_LON], 16);
-
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 20,
-        attribution: "© OpenStreetMap"
-      }).addTo(map);
 
       destMarker = L.marker([DEST_LAT, DEST_LON]).addTo(map);
       destMarker.bindPopup("Destination");
