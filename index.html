@@ -54,6 +54,10 @@
       cursor: pointer;
     }
 
+    .go-btn {
+      background: #27ae60;
+    }
+
     .test-btn {
       background: #e67e22;
     }
@@ -64,10 +68,6 @@
 
     .stop-btn {
       background: #c0392b;
-    }
-
-    .go-btn {
-      background: #27ae60;
     }
 
     .status {
@@ -83,20 +83,54 @@
       font-weight: bold;
     }
 
+    .hint {
+      font-size: 15px;
+      color: #666;
+      margin-top: 8px;
+      line-height: 1.5;
+    }
+
     #map {
       width: 100%;
       max-width: 430px;
-      height: 420px;
+      height: 430px;
       margin: 16px auto;
       border-radius: 16px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.12);
       overflow: hidden;
     }
 
-    .hint {
-      font-size: 15px;
-      color: #666;
-      margin-top: 8px;
+    .custom-marker {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      color: white;
+      font-size: 18px;
+      font-weight: bold;
+      line-height: 34px;
+      text-align: center;
+      border: 3px solid white;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    }
+
+    .marker-current {
+      background: #2980b9;
+    }
+
+    .marker-dest {
+      background: #c0392b;
+    }
+
+    .marker-next {
+      background: #27ae60;
+    }
+
+    .marker-snap {
+      background: #7f8c8d;
+      width: 22px;
+      height: 22px;
+      line-height: 22px;
+      font-size: 12px;
     }
   </style>
 </head>
@@ -112,7 +146,9 @@
   <button class="reset-btn" onclick="resetRoute()">Reset Route</button>
   <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
 
-  <div class="hint">請先按 Start GPS，再直接在地圖上點選目的地。</div>
+  <div class="hint">
+    先按 Start GPS，等目前位置出現後，在地圖上點目的地，再按 Go to Selected Point。
+  </div>
 
   <div id="map"></div>
 
@@ -129,7 +165,7 @@
 
   <div class="card">
     <div class="label">Selected Destination</div>
-    <div class="value" id="dest">請在地圖上點選目的地</div>
+    <div class="value" id="dest">尚未選擇</div>
 
     <div class="label">Trigger Radius</div>
     <div class="value" id="radius">20 m</div>
@@ -159,10 +195,8 @@
   <script>
     const SERVER_BASE_URL = "https://shadebike-server.onrender.com";
 
-    // 觸發距離。手機 GPS 誤差常常 10 m 以上，所以先用 20 m 比較穩
     const TRIGGER_DISTANCE = 20;
 
-    // 成大附近預設地圖中心
     const DEFAULT_CENTER_LAT = 23.0015;
     const DEFAULT_CENTER_LON = 120.2190;
 
@@ -185,9 +219,32 @@
     let map = null;
     let currentMarker = null;
     let destMarker = null;
-    let routeLine = null;
+    let startSnapMarker = null;
+    let destSnapMarker = null;
     let nextMarker = null;
+
+    let routeLine = null;
+    let startConnectorLine = null;
+    let destConnectorLine = null;
     let routePointMarkers = [];
+
+    function makeIcon(text, className) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='custom-marker " + className + "'>" + text + "</div>",
+        iconSize: [34, 34],
+        iconAnchor: [17, 17]
+      });
+    }
+
+    function makeSmallIcon(text) {
+      return L.divIcon({
+        className: "",
+        html: "<div class='custom-marker marker-snap'>" + text + "</div>",
+        iconSize: [22, 22],
+        iconAnchor: [11, 11]
+      });
+    }
 
     function initMap() {
       if (map !== null) {
@@ -196,7 +253,6 @@
 
       map = L.map("map").setView([DEFAULT_CENTER_LAT, DEFAULT_CENTER_LON], 16);
 
-      // ArcGIS Pro 使用的 World_Topo_Map 底圖
       L.tileLayer(
         "https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
         {
@@ -210,6 +266,10 @@
       });
     }
 
+    window.addEventListener("load", function() {
+      initMap();
+    });
+
     function setDestination(lat, lon) {
       selectedDestLat = lat;
       selectedDestLon = lon;
@@ -218,21 +278,20 @@
         lat.toFixed(8) + ", " + lon.toFixed(8);
 
       if (destMarker === null) {
-        destMarker = L.marker([lat, lon]).addTo(map);
-        destMarker.bindPopup("Selected Destination");
+        destMarker = L.marker(
+          [lat, lon],
+          { icon: makeIcon("D", "marker-dest") }
+        ).addTo(map);
       } else {
         destMarker.setLatLng([lat, lon]);
       }
 
-      destMarker.openPopup();
+      destMarker.bindPopup("Selected Destination").openPopup();
+
+      resetRouteOnly();
 
       document.getElementById("status").innerHTML =
         "Destination selected. Press Go to Selected Point.";
-
-      // 如果已經有 GPS，可以自動算路
-      if (latestLat !== null && latestLon !== null) {
-        requestRoute(latestLat, latestLon, selectedDestLat, selectedDestLon);
-      }
     }
 
     function startGPS() {
@@ -282,12 +341,9 @@
       if (!routeLoaded && !routeRequesting) {
         if (selectedDestLat === null || selectedDestLon === null) {
           document.getElementById("status").innerHTML =
-            "GPS ready. Please tap a destination on the map.";
+            "GPS ready. Tap a destination on the map.";
           return;
         }
-
-        requestRoute(lat, lon, selectedDestLat, selectedDestLon);
-        return;
       }
 
       if (routeLoaded) {
@@ -331,7 +387,7 @@
       routeRequesting = true;
       routeLoaded = false;
 
-      clearRouteDrawing();
+      resetRouteOnly();
 
       const url =
         SERVER_BASE_URL +
@@ -363,15 +419,16 @@
             return;
           }
 
-          routePoints = data.route;
+          routePoints = data.route || [];
           routeGeometry = data.route_geometry || [];
 
-          if (routePoints.length > 1) {
-            currentRouteIndex = 1;
-          } else {
-            currentRouteIndex = 0;
+          if (routePoints.length === 0) {
+            document.getElementById("status").innerHTML =
+              "Route loaded but has no points.";
+            return;
           }
 
+          currentRouteIndex = routePoints.length > 1 ? 1 : 0;
           lastSentIndex = -1;
           routeLoaded = true;
 
@@ -381,6 +438,8 @@
             "<br>Geometry points: " + routeGeometry.length +
             "<br>Start node: " + data.start_node +
             "<br>Dest node: " + data.dest_node +
+            "<br>Start snap distance: " + Number(data.start_distance_m).toFixed(1) + " m" +
+            "<br>Dest snap distance: " + Number(data.dest_distance_m).toFixed(1) + " m" +
             "<br>Total cost: " + Number(data.total_cost).toFixed(2);
 
           document.getElementById("status").innerHTML =
@@ -403,25 +462,136 @@
         });
     }
 
+    function updateCurrentLocationOnMap(lat, lon) {
+      if (map === null) {
+        return;
+      }
+
+      if (currentMarker === null) {
+        currentMarker = L.marker(
+          [lat, lon],
+          { icon: makeIcon("C", "marker-current") }
+        ).addTo(map);
+        currentMarker.bindPopup("Current Location");
+
+        map.setView([lat, lon], 17);
+      } else {
+        currentMarker.setLatLng([lat, lon]);
+      }
+    }
+
+    function drawRouteOnMap() {
+      if (map === null || routePoints.length === 0) {
+        return;
+      }
+
+      let networkLatLngs = [];
+
+      if (routeGeometry && routeGeometry.length > 0) {
+        networkLatLngs = routeGeometry;
+      } else {
+        networkLatLngs = routePoints.map(p => [p.lat, p.lon]);
+      }
+
+      if (networkLatLngs.length === 0) {
+        return;
+      }
+
+      routeLine = L.polyline(networkLatLngs, {
+        color: "#2e86ff",
+        weight: 6,
+        opacity: 0.85
+      }).addTo(map);
+
+      const firstRoutePoint = routePoints[0];
+      const lastRoutePoint = routePoints[routePoints.length - 1];
+
+      startSnapMarker = L.marker(
+        [firstRoutePoint.lat, firstRoutePoint.lon],
+        { icon: makeSmallIcon("S") }
+      ).addTo(map);
+      startSnapMarker.bindPopup("Snapped start node: " + firstRoutePoint.node_id);
+
+      destSnapMarker = L.marker(
+        [lastRoutePoint.lat, lastRoutePoint.lon],
+        { icon: makeSmallIcon("E") }
+      ).addTo(map);
+      destSnapMarker.bindPopup("Snapped destination node: " + lastRoutePoint.node_id);
+
+      if (latestLat !== null && latestLon !== null) {
+        startConnectorLine = L.polyline(
+          [
+            [latestLat, latestLon],
+            [firstRoutePoint.lat, firstRoutePoint.lon]
+          ],
+          {
+            color: "#f39c12",
+            weight: 4,
+            opacity: 0.8,
+            dashArray: "8,8"
+          }
+        ).addTo(map);
+      }
+
+      if (selectedDestLat !== null && selectedDestLon !== null) {
+        destConnectorLine = L.polyline(
+          [
+            [lastRoutePoint.lat, lastRoutePoint.lon],
+            [selectedDestLat, selectedDestLon]
+          ],
+          {
+            color: "#c0392b",
+            weight: 4,
+            opacity: 0.8,
+            dashArray: "8,8"
+          }
+        ).addTo(map);
+      }
+
+      for (let i = 0; i < routePoints.length; i++) {
+        const p = routePoints[i];
+
+        const marker = L.circleMarker([p.lat, p.lon], {
+          radius: 5,
+          color: "#2e86ff",
+          weight: 2,
+          fillColor: "#2e86ff",
+          fillOpacity: 0.9
+        }).addTo(map);
+
+        marker.bindPopup(
+          "Index: " + i +
+          "<br>Node: " + p.node_id +
+          "<br>Action: " + p.action
+        );
+
+        routePointMarkers.push(marker);
+      }
+
+      updateNextMarker();
+
+      const bounds = L.latLngBounds(networkLatLngs);
+
+      if (currentMarker !== null) {
+        bounds.extend(currentMarker.getLatLng());
+      }
+
+      if (destMarker !== null) {
+        bounds.extend(destMarker.getLatLng());
+      }
+
+      map.fitBounds(bounds, {
+        padding: [30, 30]
+      });
+    }
+
     function checkRouteProgress(currentLat, currentLon) {
       if (!routeLoaded || routePoints.length === 0) {
         return;
       }
 
       if (currentRouteIndex >= routePoints.length) {
-        document.getElementById("status").innerHTML =
-          "Navigation finished.";
-
-        document.getElementById("nextPoint").innerHTML =
-          "Arrived.";
-
-        document.getElementById("dist").innerHTML =
-          "--";
-
-        document.getElementById("action").innerHTML =
-          "--";
-
-        updateNextMarker();
+        setArrivedState();
         return;
       }
 
@@ -463,94 +633,6 @@
       }
     }
 
-    function updateCurrentLocationOnMap(lat, lon) {
-      if (map === null) {
-        return;
-      }
-
-      if (currentMarker === null) {
-        currentMarker = L.marker([lat, lon]).addTo(map);
-        currentMarker.bindPopup("Current Location");
-
-        map.setView([lat, lon], 17);
-      } else {
-        currentMarker.setLatLng([lat, lon]);
-      }
-    }
-
-    function drawRouteOnMap() {
-      if (map === null || routePoints.length === 0) {
-        return;
-      }
-
-      let latlngs = [];
-
-      if (routeGeometry && routeGeometry.length > 0) {
-        latlngs = routeGeometry;
-      } else {
-        latlngs = routePoints.map(p => [p.lat, p.lon]);
-      }
-
-      routeLine = L.polyline(latlngs, {
-        weight: 6,
-        opacity: 0.85
-      }).addTo(map);
-
-      for (let i = 0; i < routePoints.length; i++) {
-        const p = routePoints[i];
-
-        const marker = L.circleMarker([p.lat, p.lon], {
-          radius: 6,
-          weight: 2,
-          fillOpacity: 0.9
-        }).addTo(map);
-
-        marker.bindPopup(
-          "Index: " + i +
-          "<br>Node: " + p.node_id +
-          "<br>Action: " + p.action
-        );
-
-        routePointMarkers.push(marker);
-      }
-
-      updateNextMarker();
-
-      const bounds = L.latLngBounds(latlngs);
-
-      if (currentMarker !== null) {
-        bounds.extend(currentMarker.getLatLng());
-      }
-
-      if (destMarker !== null) {
-        bounds.extend(destMarker.getLatLng());
-      }
-
-      map.fitBounds(bounds, {
-        padding: [30, 30]
-      });
-    }
-
-    function clearRouteDrawing() {
-      if (routeLine !== null && map !== null) {
-        map.removeLayer(routeLine);
-        routeLine = null;
-      }
-
-      if (map !== null) {
-        for (let i = 0; i < routePointMarkers.length; i++) {
-          map.removeLayer(routePointMarkers[i]);
-        }
-      }
-
-      routePointMarkers = [];
-
-      if (nextMarker !== null && map !== null) {
-        map.removeLayer(nextMarker);
-        nextMarker = null;
-      }
-    }
-
     function updateNextPointDisplay() {
       if (!routeLoaded || routePoints.length === 0) {
         document.getElementById("nextPoint").innerHTML =
@@ -564,13 +646,7 @@
       }
 
       if (currentRouteIndex >= routePoints.length) {
-        document.getElementById("nextPoint").innerHTML =
-          "Arrived.";
-
-        document.getElementById("action").innerHTML =
-          "--";
-
-        updateNextMarker();
+        setArrivedState();
         return;
       }
 
@@ -604,7 +680,10 @@
       const target = routePoints[currentRouteIndex];
 
       if (nextMarker === null) {
-        nextMarker = L.marker([target.lat, target.lon]).addTo(map);
+        nextMarker = L.marker(
+          [target.lat, target.lon],
+          { icon: makeIcon("N", "marker-next") }
+        ).addTo(map);
       } else {
         nextMarker.setLatLng([target.lat, target.lon]);
       }
@@ -614,6 +693,100 @@
         "<br>Node: " + target.node_id +
         "<br>Index: " + currentRouteIndex
       );
+    }
+
+    function setArrivedState() {
+      document.getElementById("status").innerHTML =
+        "Navigation finished.";
+
+      document.getElementById("nextPoint").innerHTML =
+        "Arrived.";
+
+      document.getElementById("dist").innerHTML =
+        "--";
+
+      document.getElementById("action").innerHTML =
+        "--";
+
+      if (nextMarker !== null && map !== null) {
+        map.removeLayer(nextMarker);
+        nextMarker = null;
+      }
+    }
+
+    function resetRouteOnly() {
+      routePoints = [];
+      routeGeometry = [];
+      currentRouteIndex = 0;
+      routeLoaded = false;
+      routeRequesting = false;
+      lastSentIndex = -1;
+
+      clearRouteDrawing();
+
+      document.getElementById("routeStatus").innerHTML =
+        "No route yet";
+
+      document.getElementById("nextPoint").innerHTML =
+        "--";
+
+      document.getElementById("dist").innerHTML =
+        "--";
+
+      document.getElementById("action").innerHTML =
+        "--";
+    }
+
+    function resetRoute() {
+      resetRouteOnly();
+
+      document.getElementById("commandStatus").innerHTML =
+        "No command sent yet";
+
+      document.getElementById("status").innerHTML =
+        "Route reset. You can tap another destination.";
+    }
+
+    function clearRouteDrawing() {
+      const layers = [
+        routeLine,
+        startConnectorLine,
+        destConnectorLine,
+        startSnapMarker,
+        destSnapMarker,
+        nextMarker
+      ];
+
+      for (let i = 0; i < layers.length; i++) {
+        if (layers[i] !== null && map !== null) {
+          map.removeLayer(layers[i]);
+        }
+      }
+
+      routeLine = null;
+      startConnectorLine = null;
+      destConnectorLine = null;
+      startSnapMarker = null;
+      destSnapMarker = null;
+      nextMarker = null;
+
+      if (map !== null) {
+        for (let i = 0; i < routePointMarkers.length; i++) {
+          map.removeLayer(routePointMarkers[i]);
+        }
+      }
+
+      routePointMarkers = [];
+    }
+
+    function stopGPS() {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+
+      document.getElementById("status").innerHTML =
+        "GPS stopped.";
     }
 
     function sendCommandToESP32(action) {
@@ -641,45 +814,6 @@
 
           console.error(error);
         });
-    }
-
-    function resetRoute() {
-      routePoints = [];
-      routeGeometry = [];
-      currentRouteIndex = 0;
-      routeLoaded = false;
-      routeRequesting = false;
-      lastSentIndex = -1;
-
-      document.getElementById("routeStatus").innerHTML =
-        "No route yet";
-
-      document.getElementById("nextPoint").innerHTML =
-        "--";
-
-      document.getElementById("dist").innerHTML =
-        "--";
-
-      document.getElementById("action").innerHTML =
-        "--";
-
-      document.getElementById("commandStatus").innerHTML =
-        "No command sent yet";
-
-      document.getElementById("status").innerHTML =
-        "Route reset. You can tap another destination.";
-
-      clearRouteDrawing();
-    }
-
-    function stopGPS() {
-      if (watchId !== null) {
-        navigator.geolocation.clearWatch(watchId);
-        watchId = null;
-      }
-
-      document.getElementById("status").innerHTML =
-        "GPS stopped.";
     }
 
     function distanceMeters(lat1, lon1, lat2, lon2) {
