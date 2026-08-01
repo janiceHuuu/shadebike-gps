@@ -168,7 +168,9 @@
 <body>
   <h1>ShadeBike GPS Navigation</h1>
 
+  <button onclick="startIMU()">Start IMU / Sensor Fusion</button>
   <button onclick="startGPS()">Start GPS</button>
+  <button class="reset-btn" onclick="resetFusion()">Reset Fusion</button>
 
   <button id="btn8AM" class="time-btn active-time" onclick="setTimeSlot('8AM')">Use 8AM Route</button>
   <button id="btn5PM" class="time-btn" onclick="setTimeSlot('5PM')">Use 5PM Route</button>
@@ -184,7 +186,7 @@
   <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
 
   <div class="hint">
-    先按 Start GPS，等目前位置出現後，在地圖上點目的地，選 8AM 或 5PM，再按 Go to Selected Point。
+    建議先按 Start IMU / Sensor Fusion，再按 Start GPS。若手機或瀏覽器無法提供 IMU，系統仍會以 GPS-only 濾波運作。等目前位置出現後，在地圖上點目的地，選 8AM 或 5PM，再按 Go to Selected Point。
   </div>
 
   <div id="map"></div>
@@ -199,8 +201,17 @@
     <div class="label">Current Longitude</div>
     <div class="value" id="lon">--</div>
 
-    <div class="label">Accuracy</div>
-    <div class="value" id="acc">--</div>
+    <div class="label">Raw GPS Accuracy</div>
+    <div class="value" id="rawAcc">--</div>
+
+    <div class="label">Filtered Accuracy Estimate</div>
+    <div class="value" id="filteredAcc">--</div>
+
+    <div class="label">Fusion / IMU Status</div>
+    <div class="value" id="fusionStatus">GPS only</div>
+
+    <div class="label">Speed / Heading</div>
+    <div class="value" id="motionStatus">--</div>
   </div>
 
   <div class="card">
@@ -262,6 +273,54 @@
     let navigationAlongDistance = 0;       // 目前沿著路線的進度距離
     let triggerConfirmCount = 0;           // 連續觸發確認次數
 
+    // 沿線進度防跳點設定：避免 GPS / filtered 位置瞬間跳到前方太多而提早觸發。
+    const MAX_ROUTE_PROGRESS_SPEED = 10;      // m/s，校園腳踏車合理上限，可依實測調整
+    const ROUTE_PROGRESS_JUMP_BUFFER = 8;     // m，允許一點定位誤差緩衝
+    const TRIGGER_OVERSHOOT_TOLERANCE = 10;   // m，若已經超過導航點太多，不直接觸發
+    let lastRouteProgressTime = null;
+    let lastProgressRejected = false;
+
+    // =========================
+    // GPS/IMU 2D navigation EKF 設定
+    // =========================
+    const USE_SENSOR_FUSION = true;
+
+    // 依手機固定方式調整：若向前加速時數值方向相反，把 EKF_FORWARD_SIGN 改成 -1。
+    // 若你的手機固定後，前進方向不是 y 軸，可改成 "x" 或 "z"。
+    const EKF_FORWARD_AXIS = "y";
+    const EKF_FORWARD_SIGN = 1;
+
+    const EKF_MAX_SPEED = 8.0;          // m/s，約 28.8 km/h
+    const EKF_MAX_FORWARD_ACC = 3.0;    // m/s^2，避免車籃震動造成加速度爆掉
+    const EKF_MAX_DT = 3.0;             // 秒，GPS 更新間隔太大時限制 dt
+    const EKF_MIN_GPS_SIGMA = 3.0;      // m
+    const EKF_MAX_GPS_SIGMA = 40.0;     // m
+
+    let imuReady = false;
+    let imuAx = 0;
+    let imuAy = 0;
+    let imuAz = 0;
+    let smoothForwardAcc = 0;
+    let gyroZDegPerSec = 0;
+    let headingDeg = null;
+    let lastIMUEventTime = null;
+
+    let navReady = false;
+    let originLat = null;
+    let originLon = null;
+
+    // EKF state x = [E, N, v, psi, ba, bg]
+    // E/N: local east/north position (m), v: forward speed (m/s),
+    // psi: heading (rad), ba: acceleration bias, bg: gyro bias (rad/s).
+    let ekfX = [0, 0, 0, 0, 0, 0];
+    let ekfP = null;
+    let lastEkfTime = null;
+
+    let latestRawLat = null;
+    let latestRawLon = null;
+    let latestRawAcc = null;
+    let latestFilteredAcc = null;
+
     // 偏離路線判斷門檻
     const OFF_ROUTE_DISTANCE = 35;
     const BACK_ON_ROUTE_DISTANCE = 25;
@@ -309,6 +368,108 @@
     let destConnectorLine = null;
 
     let routePointMarkers = [];
+
+
+    async function startIMU() {
+      try {
+        if (
+          typeof DeviceMotionEvent !== "undefined" &&
+          typeof DeviceMotionEvent.requestPermission === "function"
+        ) {
+          const motionPermission = await DeviceMotionEvent.requestPermission();
+
+          if (motionPermission !== "granted") {
+            document.getElementById("fusionStatus").innerHTML =
+              "IMU permission denied";
+            document.getElementById("status").innerHTML =
+              "IMU motion permission denied.";
+            return;
+          }
+        }
+
+        if (
+          typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function"
+        ) {
+          const orientationPermission = await DeviceOrientationEvent.requestPermission();
+
+          if (orientationPermission !== "granted") {
+            document.getElementById("fusionStatus").innerHTML =
+              "Orientation permission denied";
+            document.getElementById("status").innerHTML =
+              "IMU orientation permission denied.";
+            return;
+          }
+        }
+
+        window.addEventListener("devicemotion", handleMotion, true);
+        window.addEventListener("deviceorientation", handleOrientation, true);
+
+        imuReady = true;
+
+        document.getElementById("fusionStatus").innerHTML =
+          "IMU started";
+        document.getElementById("status").innerHTML =
+          "IMU started. Now press Start GPS.";
+      } catch (error) {
+        document.getElementById("fusionStatus").innerHTML =
+          "IMU unavailable";
+        document.getElementById("status").innerHTML =
+          "Failed to start IMU. GPS-only mode is still available.";
+        console.error(error);
+      }
+    }
+
+    function handleMotion(event) {
+      const acc = event.acceleration;
+
+      if (acc) {
+        imuAx = Number(acc.x || 0);
+        imuAy = Number(acc.y || 0);
+        imuAz = Number(acc.z || 0);
+      }
+
+      const rot = event.rotationRate;
+
+      if (rot) {
+        // rotationRate.alpha 通常可作為繞垂直方向的角速度初步來源。
+        // 不同手機/瀏覽器座標定義可能不同，實測時若轉彎方向相反，需調整正負號。
+        gyroZDegPerSec = Number(rot.alpha || 0);
+      }
+
+      lastIMUEventTime = performance.now();
+    }
+
+    function handleOrientation(event) {
+      // iOS Safari 常見 webkitCompassHeading；其他瀏覽器常見 alpha。
+      if (event.webkitCompassHeading !== undefined) {
+        headingDeg = Number(event.webkitCompassHeading);
+      } else if (event.alpha !== null && event.alpha !== undefined) {
+        headingDeg = 360 - Number(event.alpha);
+      }
+
+      if (headingDeg !== null && !isNaN(headingDeg)) {
+        headingDeg = ((headingDeg % 360) + 360) % 360;
+      }
+    }
+
+    function resetFusion() {
+      navReady = false;
+      originLat = null;
+      originLon = null;
+      ekfX = [0, 0, 0, 0, 0, 0];
+      ekfP = null;
+      lastEkfTime = null;
+      smoothForwardAcc = 0;
+      latestFilteredAcc = null;
+
+      document.getElementById("filteredAcc").innerHTML = "--";
+      document.getElementById("fusionStatus").innerHTML =
+        imuReady ? "IMU started, fusion reset" : "GPS only, fusion reset";
+      document.getElementById("motionStatus").innerHTML = "--";
+      document.getElementById("status").innerHTML =
+        "Fusion reset. Wait for next GPS update.";
+    }
 
     function setTimeSlot(slot) {
       selectedTimeSlot = slot;
@@ -437,17 +598,77 @@
     }
 
     function handlePosition(position) {
-      const lat = position.coords.latitude;
-      const lon = position.coords.longitude;
-      const acc = position.coords.accuracy;
+      const rawLat = position.coords.latitude;
+      const rawLon = position.coords.longitude;
+      const rawAcc = position.coords.accuracy;
+      const rawSpeed = position.coords.speed;
+      const rawHeading = position.coords.heading;
+
+      latestRawLat = rawLat;
+      latestRawLon = rawLon;
+      latestRawAcc = rawAcc;
+
+      let lat = rawLat;
+      let lon = rawLon;
+      let filteredAcc = rawAcc;
+
+      if (USE_SENSOR_FUSION) {
+        const filtered = updateNavigationFilter(
+          rawLat,
+          rawLon,
+          rawAcc,
+          rawSpeed,
+          rawHeading
+        );
+
+        lat = filtered.lat;
+        lon = filtered.lon;
+        filteredAcc = filtered.accuracy;
+      }
 
       latestLat = lat;
       latestLon = lon;
-      latestAcc = acc;
+      latestAcc = filteredAcc;
+      latestFilteredAcc = filteredAcc;
 
       document.getElementById("lat").innerHTML = lat.toFixed(8);
       document.getElementById("lon").innerHTML = lon.toFixed(8);
-      document.getElementById("acc").innerHTML = acc.toFixed(1) + " m";
+
+      document.getElementById("rawAcc").innerHTML =
+        rawAcc !== null && rawAcc !== undefined && !isNaN(rawAcc)
+          ? rawAcc.toFixed(1) + " m"
+          : "--";
+
+      document.getElementById("filteredAcc").innerHTML =
+        filteredAcc !== null && filteredAcc !== undefined && !isNaN(filteredAcc)
+          ? filteredAcc.toFixed(1) + " m"
+          : "--";
+
+      const speedText =
+        rawSpeed !== null && rawSpeed !== undefined && !isNaN(rawSpeed)
+          ? rawSpeed.toFixed(2) + " m/s"
+          : "--";
+
+      const gpsHeadingText =
+        rawHeading !== null && rawHeading !== undefined && !isNaN(rawHeading)
+          ? rawHeading.toFixed(1) + "°"
+          : "--";
+
+      const phoneHeadingText =
+        headingDeg !== null && headingDeg !== undefined && !isNaN(headingDeg)
+          ? headingDeg.toFixed(1) + "°"
+          : "--";
+
+      document.getElementById("motionStatus").innerHTML =
+        "GPS speed: " + speedText +
+        "<br>GPS course: " + gpsHeadingText +
+        "<br>Phone heading: " + phoneHeadingText +
+        "<br>EKF speed: " + ekfX[2].toFixed(2) + " m/s";
+
+      document.getElementById("fusionStatus").innerHTML =
+        USE_SENSOR_FUSION
+          ? (imuReady ? "GPS + IMU fusion" : "GPS fusion, IMU not started")
+          : "Raw GPS";
 
       updateCurrentLocationOnMap(lat, lon);
 
@@ -823,6 +1044,7 @@
         "<br>Lon: " + Number(target.lon).toFixed(8) +
         "<br>Target route distance: " + targetAlong.toFixed(1) + " m" +
         "<br>Current route progress: " + currentAlongInfo.alongDistance.toFixed(1) + " m" +
+        "<br>Raw projected progress: " + currentAlongInfo.rawAlongDistance.toFixed(1) + " m" +
         "<br>Distance from route: " + currentAlongInfo.distanceToRoute.toFixed(1) + " m";
 
       document.getElementById("dist").innerHTML =
@@ -842,10 +1064,21 @@
         return;
       }
 
+      if (currentAlongInfo.progressRejected) {
+        triggerConfirmCount = 0;
+
+        document.getElementById("status").innerHTML =
+          "Navigation progress jump rejected. Waiting for stable GPS / EKF update.";
+
+        return;
+      }
+
       // 沿著 route_geometry 的剩餘距離小於 25 m，才算接近導航點。
-      // 並且需要連續 TRIGGER_CONFIRM_COUNT 次成立，降低單次 GPS 跳點造成的誤觸發。
+      // 但若 GPS / EKF 一次跳到導航點後方太多，也不直接觸發。
+      // 並且需要連續 TRIGGER_CONFIRM_COUNT 次成立，降低單次跳點造成的誤觸發。
       if (
         remainingAlongDistance <= TRIGGER_DISTANCE &&
+        remainingAlongDistance >= -TRIGGER_OVERSHOOT_TOLERANCE &&
         lastSentIndex !== currentRouteIndex
       ) {
         triggerConfirmCount++;
@@ -984,6 +1217,8 @@
       routePointCumDistances = [];
       navigationAlongDistance = 0;
       triggerConfirmCount = 0;
+      lastRouteProgressTime = null;
+      lastProgressRejected = false;
 
       currentRouteIndex = 0;
       routeLoaded = false;
@@ -1112,6 +1347,326 @@
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
       return R * c;
+    }
+
+
+
+    // =========================
+    // GPS/IMU 2D navigation EKF
+    // =========================
+
+    function normalizeAngleRad(angle) {
+      while (angle > Math.PI) angle -= 2 * Math.PI;
+      while (angle < -Math.PI) angle += 2 * Math.PI;
+      return angle;
+    }
+
+    function angleDiffRad(from, to) {
+      return normalizeAngleRad(to - from);
+    }
+
+    function clamp(value, minValue, maxValue) {
+      return Math.max(minValue, Math.min(maxValue, value));
+    }
+
+    function identityMatrix(n, diagonalValue) {
+      const M = [];
+
+      for (let i = 0; i < n; i++) {
+        M[i] = [];
+        for (let j = 0; j < n; j++) {
+          M[i][j] = i === j ? diagonalValue : 0;
+        }
+      }
+
+      return M;
+    }
+
+    function matMul(A, B) {
+      const rows = A.length;
+      const cols = B[0].length;
+      const inner = B.length;
+      const C = [];
+
+      for (let i = 0; i < rows; i++) {
+        C[i] = [];
+        for (let j = 0; j < cols; j++) {
+          let sum = 0;
+          for (let k = 0; k < inner; k++) {
+            sum += A[i][k] * B[k][j];
+          }
+          C[i][j] = sum;
+        }
+      }
+
+      return C;
+    }
+
+    function matTranspose(A) {
+      const rows = A.length;
+      const cols = A[0].length;
+      const T = [];
+
+      for (let j = 0; j < cols; j++) {
+        T[j] = [];
+        for (let i = 0; i < rows; i++) {
+          T[j][i] = A[i][j];
+        }
+      }
+
+      return T;
+    }
+
+    function addProcessNoise(P, dt) {
+      // 這些值是初始調參值；實測後可再調整。
+      const qPos = 0.8 * 0.8 * dt * dt;
+      const qSpeed = 1.2 * 1.2 * dt;
+      const qHeading = (15 * Math.PI / 180) * (15 * Math.PI / 180) * dt;
+      const qAccBias = 0.05 * 0.05 * dt;
+      const qGyroBias = (1.0 * Math.PI / 180) * (1.0 * Math.PI / 180) * dt;
+
+      P[0][0] += qPos;
+      P[1][1] += qPos;
+      P[2][2] += qSpeed;
+      P[3][3] += qHeading;
+      P[4][4] += qAccBias;
+      P[5][5] += qGyroBias;
+    }
+
+    function getForwardAcceleration() {
+      let raw = 0;
+
+      if (EKF_FORWARD_AXIS === "x") {
+        raw = imuAx;
+      } else if (EKF_FORWARD_AXIS === "y") {
+        raw = imuAy;
+      } else {
+        raw = imuAz;
+      }
+
+      raw = EKF_FORWARD_SIGN * raw;
+
+      // 低通濾波，降低腳踏車震動與手機微晃造成的高頻雜訊。
+      smoothForwardAcc = 0.85 * smoothForwardAcc + 0.15 * raw;
+
+      return clamp(smoothForwardAcc, -EKF_MAX_FORWARD_ACC, EKF_MAX_FORWARD_ACC);
+    }
+
+    function initNavigationFilter(lat, lon, gpsSpeed, gpsHeadingDeg) {
+      originLat = lat;
+      originLon = lon;
+
+      let initialPsi = 0;
+
+      if (gpsHeadingDeg !== null && gpsHeadingDeg !== undefined && !isNaN(gpsHeadingDeg)) {
+        initialPsi = gpsHeadingDeg * Math.PI / 180;
+      } else if (headingDeg !== null && headingDeg !== undefined && !isNaN(headingDeg)) {
+        initialPsi = headingDeg * Math.PI / 180;
+      }
+
+      ekfX = [
+        0,                                  // E
+        0,                                  // N
+        gpsSpeed || 0,                       // v
+        normalizeAngleRad(initialPsi),       // psi
+        0,                                  // ba
+        0                                   // bg
+      ];
+
+      // 初始不確定度：位置 20 m、速度 2 m/s、方向 45 度、bias 給較大不確定度。
+      ekfP = identityMatrix(6, 0);
+      ekfP[0][0] = 20 * 20;
+      ekfP[1][1] = 20 * 20;
+      ekfP[2][2] = 2 * 2;
+      ekfP[3][3] = (45 * Math.PI / 180) * (45 * Math.PI / 180);
+      ekfP[4][4] = 1 * 1;
+      ekfP[5][5] = (10 * Math.PI / 180) * (10 * Math.PI / 180);
+
+      lastEkfTime = performance.now();
+      navReady = true;
+    }
+
+    function predictNavigationEKF(dt) {
+      const E = ekfX[0];
+      const N = ekfX[1];
+      const v = ekfX[2];
+      const psi = ekfX[3];
+      const ba = ekfX[4];
+      const bg = ekfX[5];
+
+      const aForward = getForwardAcceleration() - ba;
+      const gyroZRad = (gyroZDegPerSec || 0) * Math.PI / 180;
+      const yawRate = gyroZRad - bg;
+
+      let newPsi = normalizeAngleRad(psi + yawRate * dt);
+      let newV = clamp(v + aForward * dt, 0, EKF_MAX_SPEED);
+      let newE = E + newV * Math.cos(newPsi) * dt;
+      let newN = N + newV * Math.sin(newPsi) * dt;
+
+      ekfX[0] = newE;
+      ekfX[1] = newN;
+      ekfX[2] = newV;
+      ekfX[3] = newPsi;
+
+      // Jacobian F = df/dx，簡化版本。
+      const F = identityMatrix(6, 1);
+      F[0][2] = Math.cos(newPsi) * dt;
+      F[0][3] = -newV * Math.sin(newPsi) * dt;
+      F[1][2] = Math.sin(newPsi) * dt;
+      F[1][3] = newV * Math.cos(newPsi) * dt;
+      F[2][4] = -dt;
+      F[3][5] = -dt;
+
+      ekfP = matMul(matMul(F, ekfP), matTranspose(F));
+      addProcessNoise(ekfP, dt);
+    }
+
+    function updatePositionMeasurement(gpsE, gpsN, gpsAcc) {
+      // Geolocation accuracy 通常可視為水平定位不確定度指標；這裡轉為標準差尺度使用。
+      let sigma = EKF_MAX_GPS_SIGMA;
+
+      if (gpsAcc !== null && gpsAcc !== undefined && !isNaN(gpsAcc)) {
+        sigma = clamp(gpsAcc / 2, EKF_MIN_GPS_SIGMA, EKF_MAX_GPS_SIGMA);
+      }
+
+      const r = sigma * sigma;
+
+      const y0 = gpsE - ekfX[0];
+      const y1 = gpsN - ekfX[1];
+
+      const S00 = ekfP[0][0] + r;
+      const S01 = ekfP[0][1];
+      const S10 = ekfP[1][0];
+      const S11 = ekfP[1][1] + r;
+
+      const det = S00 * S11 - S01 * S10;
+
+      if (Math.abs(det) < 1e-9) {
+        return;
+      }
+
+      const invS00 = S11 / det;
+      const invS01 = -S01 / det;
+      const invS10 = -S10 / det;
+      const invS11 = S00 / det;
+
+      const K = [];
+      for (let i = 0; i < 6; i++) {
+        K[i] = [
+          ekfP[i][0] * invS00 + ekfP[i][1] * invS10,
+          ekfP[i][0] * invS01 + ekfP[i][1] * invS11
+        ];
+      }
+
+      for (let i = 0; i < 6; i++) {
+        ekfX[i] = ekfX[i] + K[i][0] * y0 + K[i][1] * y1;
+      }
+
+      ekfX[3] = normalizeAngleRad(ekfX[3]);
+
+      const oldP = ekfP.map(row => row.slice());
+
+      for (let i = 0; i < 6; i++) {
+        for (let j = 0; j < 6; j++) {
+          ekfP[i][j] = oldP[i][j] - K[i][0] * oldP[0][j] - K[i][1] * oldP[1][j];
+        }
+      }
+    }
+
+    function updateScalarMeasurement(index, measurement, sigma, isAngle) {
+      if (measurement === null || measurement === undefined || isNaN(measurement)) {
+        return;
+      }
+
+      const r = sigma * sigma;
+      const S = ekfP[index][index] + r;
+
+      if (S <= 0) {
+        return;
+      }
+
+      let y;
+      if (isAngle) {
+        y = angleDiffRad(ekfX[index], measurement);
+      } else {
+        y = measurement - ekfX[index];
+      }
+
+      const K = [];
+      for (let i = 0; i < 6; i++) {
+        K[i] = ekfP[i][index] / S;
+      }
+
+      for (let i = 0; i < 6; i++) {
+        ekfX[i] = ekfX[i] + K[i] * y;
+      }
+
+      if (isAngle) {
+        ekfX[index] = normalizeAngleRad(ekfX[index]);
+      }
+
+      const oldP = ekfP.map(row => row.slice());
+
+      for (let i = 0; i < 6; i++) {
+        for (let j = 0; j < 6; j++) {
+          ekfP[i][j] = oldP[i][j] - K[i] * oldP[index][j];
+        }
+      }
+    }
+
+    function updateNavigationFilter(gpsLat, gpsLon, gpsAcc, gpsSpeed, gpsHeadingDeg) {
+      if (!navReady) {
+        initNavigationFilter(gpsLat, gpsLon, gpsSpeed, gpsHeadingDeg);
+      }
+
+      const now = performance.now();
+      let dt = (now - lastEkfTime) / 1000.0;
+
+      if (dt <= 0 || dt > EKF_MAX_DT) {
+        dt = 1.0;
+      }
+
+      lastEkfTime = now;
+
+      predictNavigationEKF(dt);
+
+      const gpsXY = latLonToLocalXY(gpsLat, gpsLon, originLat, originLon);
+
+      // GPS 位置更新。accuracy 很差時仍可低權重修正，不直接完全丟棄。
+      updatePositionMeasurement(gpsXY.x, gpsXY.y, gpsAcc);
+
+      // GPS speed 更新速度。手機不一定提供 speed；沒有就跳過。
+      if (gpsSpeed !== null && gpsSpeed !== undefined && !isNaN(gpsSpeed)) {
+        const speedSigma = gpsAcc !== null && gpsAcc !== undefined && gpsAcc > 30 ? 2.0 : 1.0;
+        updateScalarMeasurement(2, clamp(gpsSpeed, 0, EKF_MAX_SPEED), speedSigma, false);
+      }
+
+      // GPS course 更新 heading。速度太低時 GPS course 通常不穩，因此只在速度足夠時使用。
+      if (
+        gpsHeadingDeg !== null && gpsHeadingDeg !== undefined && !isNaN(gpsHeadingDeg) &&
+        ekfX[2] > 0.8
+      ) {
+        updateScalarMeasurement(3, gpsHeadingDeg * Math.PI / 180, 20 * Math.PI / 180, true);
+      }
+
+      // 手機 orientation 更新 heading。磁力計可能受干擾，所以權重不要太高。
+      if (headingDeg !== null && headingDeg !== undefined && !isNaN(headingDeg)) {
+        updateScalarMeasurement(3, headingDeg * Math.PI / 180, 35 * Math.PI / 180, true);
+      }
+
+      ekfX[2] = clamp(ekfX[2], 0, EKF_MAX_SPEED);
+      ekfX[3] = normalizeAngleRad(ekfX[3]);
+
+      const filteredLatLon = localXYToLatLon(ekfX[0], ekfX[1], originLat, originLon);
+
+      // 近似 95% 水平不確定度。這是 EKF 估計值，不等於實際量測誤差。
+      const sigma95 = 2 * Math.sqrt(Math.max(0, ekfP[0][0] + ekfP[1][1]));
+
+      return {
+        lat: filteredLatLon.lat,
+        lon: filteredLatLon.lon,
+        accuracy: sigma95
+      };
     }
 
     // =========================
@@ -1289,16 +1844,39 @@
         return null;
       }
 
-      // 讓路線進度大致保持往前，避免 GPS 小幅跳動造成進度倒退。
+      const now = performance.now();
+      let dt = 1.0;
+
+      if (lastRouteProgressTime !== null) {
+        dt = (now - lastRouteProgressTime) / 1000.0;
+      }
+
+      if (dt <= 0 || dt > 5) {
+        dt = 1.0;
+      }
+
+      lastRouteProgressTime = now;
+      lastProgressRejected = false;
+
+      // 讓路線進度大致保持往前，但限制單次前進不可過快。
+      // 這可以避免 GPS / filtered 位置瞬間跳到路線前方太多，造成提早觸發。
       if (projected.alongDistance > navigationAlongDistance) {
-        navigationAlongDistance = projected.alongDistance;
+        const maxAllowedProgress =
+          navigationAlongDistance + MAX_ROUTE_PROGRESS_SPEED * dt + ROUTE_PROGRESS_JUMP_BUFFER;
+
+        if (projected.alongDistance <= maxAllowedProgress) {
+          navigationAlongDistance = projected.alongDistance;
+        } else {
+          lastProgressRejected = true;
+        }
       }
 
       return {
         alongDistance: navigationAlongDistance,
         rawAlongDistance: projected.alongDistance,
         distanceToRoute: projected.distanceToRoute,
-        segmentIndex: projected.segmentIndex
+        segmentIndex: projected.segmentIndex,
+        progressRejected: lastProgressRejected
       };
     }
 
@@ -1318,6 +1896,18 @@
         R;
 
       return { x, y };
+    }
+
+    function localXYToLatLon(x, y, lat0, lon0) {
+      const R = 6371000;
+
+      const lat =
+        lat0 + (y / R) * 180 / Math.PI;
+
+      const lon =
+        lon0 + (x / (R * Math.cos(lat0 * Math.PI / 180))) * 180 / Math.PI;
+
+      return { lat, lon };
     }
 
     function distancePointToSegmentMeters(pLat, pLon, aLat, aLon, bLat, bLon) {
