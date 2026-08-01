@@ -251,6 +251,17 @@
 
     const TRIGGER_DISTANCE = 25;
 
+    // 沿 route_geometry 的導航點觸發設定
+    // 原本是用「目前位置 C 到下一導航點」的直線距離觸發；
+    // 這裡改成「沿規劃路線 route_geometry 的剩餘距離」觸發。
+    const TRIGGER_CONFIRM_COUNT = 2;       // 連續幾次滿足才觸發，避免單次 GPS 跳點
+    const ON_ROUTE_REQUIRED_DISTANCE = 35; // 離規劃路線太遠時，不觸發 L/R/S/A
+
+    let routeGeometryCumDistances = [];    // route_geometry 每個點的累積距離
+    let routePointCumDistances = [];       // routePoints 每個導航點對應的沿線距離
+    let navigationAlongDistance = 0;       // 目前沿著路線的進度距離
+    let triggerConfirmCount = 0;           // 連續觸發確認次數
+
     // 偏離路線判斷門檻
     const OFF_ROUTE_DISTANCE = 35;
     const BACK_ON_ROUTE_DISTANCE = 25;
@@ -572,6 +583,8 @@
           document.getElementById("routeDistance").innerHTML =
             "-- m";
 
+          buildRouteDistanceIndex();
+
           drawRouteOnMap();
           updateNextPointDisplay();
 
@@ -781,39 +794,86 @@
 
       const target = routePoints[currentRouteIndex];
 
-      const d = distanceMeters(
+      const currentAlongInfo = getCurrentAlongRouteDistance(
         currentLat,
-        currentLon,
-        target.lat,
-        target.lon
+        currentLon
       );
+
+      if (currentAlongInfo === null) {
+        document.getElementById("status").innerHTML =
+          "Cannot calculate along-route distance.";
+        return;
+      }
+
+      const targetAlong = routePointCumDistances[currentRouteIndex];
+
+      if (targetAlong === undefined || targetAlong === null) {
+        document.getElementById("status").innerHTML =
+          "Target along-route distance unavailable.";
+        return;
+      }
+
+      const remainingAlongDistance =
+        targetAlong - currentAlongInfo.alongDistance;
 
       document.getElementById("nextPoint").innerHTML =
         "Index: " + currentRouteIndex +
         "<br>Node: " + target.node_id +
         "<br>Lat: " + Number(target.lat).toFixed(8) +
-        "<br>Lon: " + Number(target.lon).toFixed(8);
+        "<br>Lon: " + Number(target.lon).toFixed(8) +
+        "<br>Target route distance: " + targetAlong.toFixed(1) + " m" +
+        "<br>Current route progress: " + currentAlongInfo.alongDistance.toFixed(1) + " m" +
+        "<br>Distance from route: " + currentAlongInfo.distanceToRoute.toFixed(1) + " m";
 
       document.getElementById("dist").innerHTML =
-        d.toFixed(1) + " m";
+        Math.max(0, remainingAlongDistance).toFixed(1) + " m";
 
       document.getElementById("action").innerHTML =
         target.action;
 
-      if (d <= TRIGGER_DISTANCE && lastSentIndex !== currentRouteIndex) {
-        lastSentIndex = currentRouteIndex;
+      // 離規劃路線太遠時，不觸發導航點。
+      // 注意：這裡不會把 C 點強制吸附到路線上，只是避免距離路線太遠時誤觸發。
+      if (currentAlongInfo.distanceToRoute > ON_ROUTE_REQUIRED_DISTANCE) {
+        triggerConfirmCount = 0;
 
         document.getElementById("status").innerHTML =
-          "<span class='trigger'>Trigger: " + target.action + "</span>";
+          "GPS updated, but too far from route to trigger navigation point.";
 
-        sendCommandToESP32(target.action);
+        return;
+      }
 
-        currentRouteIndex++;
+      // 沿著 route_geometry 的剩餘距離小於 25 m，才算接近導航點。
+      // 並且需要連續 TRIGGER_CONFIRM_COUNT 次成立，降低單次 GPS 跳點造成的誤觸發。
+      if (
+        remainingAlongDistance <= TRIGGER_DISTANCE &&
+        lastSentIndex !== currentRouteIndex
+      ) {
+        triggerConfirmCount++;
 
-        updateNextPointDisplay();
+        document.getElementById("status").innerHTML =
+          "<span class='trigger'>Near navigation point: " +
+          Math.max(0, remainingAlongDistance).toFixed(1) +
+          " m along route, confirm " +
+          triggerConfirmCount +
+          "/" +
+          TRIGGER_CONFIRM_COUNT +
+          "</span>";
+
+        if (triggerConfirmCount >= TRIGGER_CONFIRM_COUNT) {
+          lastSentIndex = currentRouteIndex;
+
+          sendCommandToESP32(target.action);
+
+          currentRouteIndex++;
+          triggerConfirmCount = 0;
+
+          updateNextPointDisplay();
+        }
       } else {
+        triggerConfirmCount = 0;
+
         document.getElementById("status").innerHTML =
-          "GPS updated. Navigating...";
+          "GPS updated. Navigating by along-route distance...";
       }
     }
 
@@ -835,12 +895,21 @@
       }
 
       const target = routePoints[currentRouteIndex];
+      const targetAlong = routePointCumDistances[currentRouteIndex];
+
+      let targetAlongText = "";
+
+      if (targetAlong !== undefined && targetAlong !== null) {
+        targetAlongText =
+          "<br>Target route distance: " + targetAlong.toFixed(1) + " m";
+      }
 
       document.getElementById("nextPoint").innerHTML =
         "Index: " + currentRouteIndex +
         "<br>Node: " + target.node_id +
         "<br>Lat: " + Number(target.lat).toFixed(8) +
-        "<br>Lon: " + Number(target.lon).toFixed(8);
+        "<br>Lon: " + Number(target.lon).toFixed(8) +
+        targetAlongText;
 
       document.getElementById("action").innerHTML =
         target.action;
@@ -910,6 +979,11 @@
       edgeInfo = [];
       startSnap = null;
       destSnap = null;
+
+      routeGeometryCumDistances = [];
+      routePointCumDistances = [];
+      navigationAlongDistance = 0;
+      triggerConfirmCount = 0;
 
       currentRouteIndex = 0;
       routeLoaded = false;
@@ -1038,6 +1112,194 @@
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
       return R * c;
+    }
+
+    // =========================
+    // 沿 route_geometry 距離計算
+    // =========================
+
+    function getNavigationGeometry() {
+      if (routeGeometry && routeGeometry.length >= 2) {
+        return routeGeometry;
+      }
+
+      if (routePoints && routePoints.length >= 2) {
+        return routePoints.map(p => [p.lat, p.lon]);
+      }
+
+      return [];
+    }
+
+    function buildCumulativeDistancesForGeometry(geometry) {
+      const cum = [];
+
+      if (!geometry || geometry.length === 0) {
+        return cum;
+      }
+
+      cum.push(0);
+
+      for (let i = 1; i < geometry.length; i++) {
+        const prev = geometry[i - 1];
+        const curr = geometry[i];
+
+        const d = distanceMeters(
+          prev[0],
+          prev[1],
+          curr[0],
+          curr[1]
+        );
+
+        cum.push(cum[i - 1] + d);
+      }
+
+      return cum;
+    }
+
+    function closestPointOnGeometryAlong(lat, lon, minAlongDistance) {
+      const geometry = getNavigationGeometry();
+
+      if (!geometry || geometry.length < 2) {
+        return null;
+      }
+
+      if (!routeGeometryCumDistances || routeGeometryCumDistances.length !== geometry.length) {
+        routeGeometryCumDistances = buildCumulativeDistancesForGeometry(geometry);
+      }
+
+      let best = null;
+      let bestDistance = Infinity;
+
+      for (let i = 0; i < geometry.length - 1; i++) {
+        const a = geometry[i];
+        const b = geometry[i + 1];
+
+        const aLat = a[0];
+        const aLon = a[1];
+        const bLat = b[0];
+        const bLon = b[1];
+
+        const p = latLonToLocalXY(lat, lon, lat, lon);
+        const pa = latLonToLocalXY(aLat, aLon, lat, lon);
+        const pb = latLonToLocalXY(bLat, bLon, lat, lon);
+
+        const abx = pb.x - pa.x;
+        const aby = pb.y - pa.y;
+
+        const apx = p.x - pa.x;
+        const apy = p.y - pa.y;
+
+        const abLen2 = abx * abx + aby * aby;
+
+        if (abLen2 === 0) {
+          continue;
+        }
+
+        let t = (apx * abx + apy * aby) / abLen2;
+        t = Math.max(0, Math.min(1, t));
+
+        const qx = pa.x + t * abx;
+        const qy = pa.y + t * aby;
+
+        const dx = p.x - qx;
+        const dy = p.y - qy;
+
+        const distToSegment = Math.sqrt(dx * dx + dy * dy);
+
+        const segmentLength =
+          routeGeometryCumDistances[i + 1] - routeGeometryCumDistances[i];
+
+        const alongDistance =
+          routeGeometryCumDistances[i] + t * segmentLength;
+
+        // 避免 GPS 小幅跳動時把目前進度對到前面的路段。
+        // 這不是把位置吸附到路網，只是讓「沿線進度」不要倒退太多。
+        if (
+          minAlongDistance !== undefined &&
+          minAlongDistance !== null &&
+          alongDistance < minAlongDistance
+        ) {
+          continue;
+        }
+
+        if (distToSegment < bestDistance) {
+          bestDistance = distToSegment;
+
+          best = {
+            distanceToRoute: distToSegment,
+            alongDistance: alongDistance,
+            segmentIndex: i
+          };
+        }
+      }
+
+      // 若因為 minAlongDistance 限制找不到，就放寬限制再找一次。
+      if (best === null && minAlongDistance !== undefined && minAlongDistance !== null) {
+        return closestPointOnGeometryAlong(lat, lon, null);
+      }
+
+      return best;
+    }
+
+    function buildRouteDistanceIndex() {
+      const geometry = getNavigationGeometry();
+
+      if (!geometry || geometry.length < 2 || !routePoints || routePoints.length === 0) {
+        routeGeometryCumDistances = [];
+        routePointCumDistances = [];
+        navigationAlongDistance = 0;
+        return;
+      }
+
+      routeGeometryCumDistances = buildCumulativeDistancesForGeometry(geometry);
+      routePointCumDistances = [];
+
+      let previousAlong = 0;
+
+      for (let i = 0; i < routePoints.length; i++) {
+        const p = routePoints[i];
+
+        // 導航點依序對應到 route_geometry 上的沿線距離。
+        // 用 previousAlong 限制，避免路線接近或交會時對到前面的線段。
+        const projected = closestPointOnGeometryAlong(
+          p.lat,
+          p.lon,
+          Math.max(0, previousAlong - 3)
+        );
+
+        if (projected) {
+          routePointCumDistances.push(projected.alongDistance);
+          previousAlong = projected.alongDistance;
+        } else {
+          routePointCumDistances.push(previousAlong);
+        }
+      }
+
+      navigationAlongDistance = 0;
+    }
+
+    function getCurrentAlongRouteDistance(currentLat, currentLon) {
+      const projected = closestPointOnGeometryAlong(
+        currentLat,
+        currentLon,
+        Math.max(0, navigationAlongDistance - 5)
+      );
+
+      if (!projected) {
+        return null;
+      }
+
+      // 讓路線進度大致保持往前，避免 GPS 小幅跳動造成進度倒退。
+      if (projected.alongDistance > navigationAlongDistance) {
+        navigationAlongDistance = projected.alongDistance;
+      }
+
+      return {
+        alongDistance: navigationAlongDistance,
+        rawAlongDistance: projected.alongDistance,
+        distanceToRoute: projected.distanceToRoute,
+        segmentIndex: projected.segmentIndex
+      };
     }
 
     // =========================
