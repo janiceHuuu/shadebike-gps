@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ShadeBike GPS/IMU Full 2D EKF Navigation</title>
+  <title>ShadeBike Raw GPS / GPS+IMU EKF Test Navigation</title>
 
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -162,15 +162,46 @@
       font-weight: bold;
       box-shadow: 0 1px 5px rgba(0,0,0,0.35);
     }
+
+
+    .mode-btn {
+      background: #16a085;
+    }
+
+    .active-mode {
+      outline: 5px solid #f1c40f;
+      background: #0e6655;
+    }
+
+    .log-btn {
+      background: #34495e;
+    }
+
+    .small-text {
+      font-size: 14px;
+      font-weight: normal;
+      line-height: 1.5;
+    }
+
+    .marker-raw {
+      background: #f39c12;
+    }
+
+    .marker-filtered {
+      background: #8e44ad;
+    }
   </style>
 </head>
 
 <body>
-  <h1>ShadeBike GPS/IMU Full 2D EKF Navigation</h1>
+  <h1>ShadeBike Raw GPS / GPS+IMU EKF Test Navigation</h1>
 
   <button onclick="startIMU()">Start IMU / Sensor Fusion</button>
   <button onclick="startGPS()">Start GPS</button>
   <button class="reset-btn" onclick="resetFusion()">Reset Fusion</button>
+
+  <button id="modeRawBtn" class="mode-btn" onclick="setPositionMode('raw')">Use Raw GPS Mode</button>
+  <button id="modeEkfBtn" class="mode-btn active-mode" onclick="setPositionMode('ekf')">Use GPS + IMU EKF Mode</button>
 
   <button id="btn8AM" class="time-btn active-time" onclick="setTimeSlot('8AM')">Use 8AM Route</button>
   <button id="btn5PM" class="time-btn" onclick="setTimeSlot('5PM')">Use 5PM Route</button>
@@ -186,7 +217,7 @@
   <button class="stop-btn" onclick="stopGPS()">Stop GPS</button>
 
   <div class="hint">
-    建議先按 Start IMU / Sensor Fusion，再按 Start GPS。此版本使用完整 2D 腳踏車 EKF：IMU 更新時做 prediction，GPS 更新時做 measurement update。若手機或瀏覽器無法提供 IMU，系統仍會以 GPS EKF 方式運作。等目前位置出現後，在地圖上點目的地，選 8AM 或 5PM，再按 Go to Selected Point。
+    此版本可切換 Raw GPS / GPS + IMU EKF 兩種定位模式。建議先按 Start IMU / Sensor Fusion，再按 Start GPS。若要做對照實驗，請用同一條路線分別測 Raw GPS mode 與 EKF mode，並用下方測試紀錄功能下載 CSV。
   </div>
 
   <div id="map"></div>
@@ -206,6 +237,9 @@
 
     <div class="label">Filtered Accuracy Estimate</div>
     <div class="value" id="filteredAcc">--</div>
+
+    <div class="label">Position Mode Used for Navigation</div>
+    <div class="value" id="positionModeDisplay">GPS + IMU EKF</div>
 
     <div class="label">Fusion / IMU Status</div>
     <div class="value" id="fusionStatus">GPS only</div>
@@ -255,6 +289,18 @@
     <div class="value" id="commandStatus">No command sent yet</div>
   </div>
 
+  <div class="card">
+    <div class="label">Test Log</div>
+    <div class="value" id="logStatus">Log not started</div>
+    <button class="log-btn" onclick="startTestLog()">Start Test Log</button>
+    <button class="log-btn" onclick="stopTestLog()">Stop Test Log</button>
+    <button class="log-btn" onclick="downloadTestLog()">Download CSV</button>
+    <button class="reset-btn" onclick="clearTestLog()">Clear Log</button>
+    <div class="hint">
+      CSV 會同時記錄 Raw GPS 與 EKF filtered 位置、accuracy、距離路線、沿線進度、到下一導航點剩餘距離、送出的 ESP32 指令。
+    </div>
+  </div>
+
   <div class="status" id="status">Press Start GPS</div>
 
   <script>
@@ -283,6 +329,12 @@
     // =========================
     // GPS/IMU 2D navigation EKF 設定
     // =========================
+    // positionMode 決定「導航判斷」使用哪個位置。
+    // EKF 仍會在背景持續計算，方便同一份 CSV 同時記錄 Raw 與 EKF。
+    const POSITION_MODE_RAW = "raw";
+    const POSITION_MODE_EKF = "ekf";
+    let positionMode = POSITION_MODE_EKF;
+
     const USE_SENSOR_FUSION = true;
 
     // 依手機固定方式調整：若向前加速時數值方向相反，把 EKF_FORWARD_SIGN 改成 -1。
@@ -362,6 +414,8 @@
     let map = null;
 
     let currentMarker = null;
+    let rawGpsMarker = null;
+    let filteredMarker = null;
     let destMarker = null;
     let startSnapMarker = null;
     let destSnapMarker = null;
@@ -373,6 +427,12 @@
     let destConnectorLine = null;
 
     let routePointMarkers = [];
+
+    let testLogActive = false;
+    let testLogRows = [];
+    let testLogStartTime = null;
+    let lastSentCommandForLog = "";
+    let lastCommandSeqForLog = "";
 
 
     async function startIMU() {
@@ -482,6 +542,38 @@
       document.getElementById("motionStatus").innerHTML = "--";
       document.getElementById("status").innerHTML =
         "Fusion reset. Wait for next GPS update.";
+    }
+
+    function setPositionMode(mode) {
+      if (mode !== POSITION_MODE_RAW && mode !== POSITION_MODE_EKF) {
+        return;
+      }
+
+      positionMode = mode;
+
+      const rawBtn = document.getElementById("modeRawBtn");
+      const ekfBtn = document.getElementById("modeEkfBtn");
+
+      if (mode === POSITION_MODE_RAW) {
+        rawBtn.classList.add("active-mode");
+        ekfBtn.classList.remove("active-mode");
+        document.getElementById("positionModeDisplay").innerHTML = "Raw GPS";
+        document.getElementById("status").innerHTML =
+          "Position mode changed to Raw GPS. Navigation will use raw GPS coordinates.";
+      } else {
+        ekfBtn.classList.add("active-mode");
+        rawBtn.classList.remove("active-mode");
+        document.getElementById("positionModeDisplay").innerHTML = "GPS + IMU EKF";
+        document.getElementById("status").innerHTML =
+          "Position mode changed to GPS + IMU EKF. Navigation will use filtered coordinates.";
+      }
+
+      // 切換定位來源後，導航沿線進度重新開始估計，避免前一模式的進度殘留。
+      navigationAlongDistance = 0;
+      triggerConfirmCount = 0;
+      lastRouteProgressTime = null;
+      lastProgressRejected = false;
+      isOffRoute = false;
     }
 
     function setTimeSlot(slot) {
@@ -621,27 +713,31 @@
       latestRawLon = rawLon;
       latestRawAcc = rawAcc;
 
+      const filtered = updateNavigationFilter(
+        rawLat,
+        rawLon,
+        rawAcc,
+        rawSpeed,
+        rawHeading
+      );
+
+      const filteredLat = filtered.lat;
+      const filteredLon = filtered.lon;
+      const filteredAcc = filtered.accuracy;
+
       let lat = rawLat;
       let lon = rawLon;
-      let filteredAcc = rawAcc;
+      let usedAcc = rawAcc;
 
-      if (USE_SENSOR_FUSION) {
-        const filtered = updateNavigationFilter(
-          rawLat,
-          rawLon,
-          rawAcc,
-          rawSpeed,
-          rawHeading
-        );
-
-        lat = filtered.lat;
-        lon = filtered.lon;
-        filteredAcc = filtered.accuracy;
+      if (positionMode === POSITION_MODE_EKF) {
+        lat = filteredLat;
+        lon = filteredLon;
+        usedAcc = filteredAcc;
       }
 
       latestLat = lat;
       latestLon = lon;
-      latestAcc = filteredAcc;
+      latestAcc = usedAcc;
       latestFilteredAcc = filteredAcc;
 
       document.getElementById("lat").innerHTML = lat.toFixed(8);
@@ -656,6 +752,9 @@
         filteredAcc !== null && filteredAcc !== undefined && !isNaN(filteredAcc)
           ? filteredAcc.toFixed(1) + " m"
           : "--";
+
+      document.getElementById("positionModeDisplay").innerHTML =
+        positionMode === POSITION_MODE_RAW ? "Raw GPS" : "GPS + IMU EKF";
 
       const speedText =
         rawSpeed !== null && rawSpeed !== undefined && !isNaN(rawSpeed)
@@ -681,14 +780,39 @@
         "<br>GPS course: " + gpsHeadingText +
         "<br>Phone heading: " + phoneHeadingText +
         "<br>EKF speed: " + ekfX[2].toFixed(2) + " m/s" +
-        "<br>" + gpsUpdateText;
+        "<br>" + gpsUpdateText +
+        (lastGpsRejectReason ? "<br>Reject reason: " + lastGpsRejectReason : "");
 
       document.getElementById("fusionStatus").innerHTML =
-        USE_SENSOR_FUSION
-          ? (imuReady ? "GPS + IMU full 2D EKF" : "GPS EKF, IMU not started")
-          : "Raw GPS";
+        imuReady ? "GPS + IMU full 2D EKF running" : "GPS EKF running, IMU not started";
 
       updateCurrentLocationOnMap(lat, lon);
+      updateComparisonMarkers(rawLat, rawLon, filteredLat, filteredLon);
+
+      const rawRouteMetrics = calculateRouteMetricsForPoint(rawLat, rawLon);
+      const filteredRouteMetrics = calculateRouteMetricsForPoint(filteredLat, filteredLon);
+      const usedRouteMetrics =
+        positionMode === POSITION_MODE_RAW ? rawRouteMetrics : filteredRouteMetrics;
+
+      addTestLogEntry({
+        eventType: "position",
+        command: "",
+        commandSeq: "",
+        rawLat,
+        rawLon,
+        rawAcc,
+        rawSpeed,
+        rawHeading,
+        filteredLat,
+        filteredLon,
+        filteredAcc,
+        usedLat: lat,
+        usedLon: lon,
+        usedAcc: usedAcc,
+        rawRouteMetrics,
+        filteredRouteMetrics,
+        usedRouteMetrics
+      });
 
       if (!routeLoaded && !routeRequesting) {
         if (selectedDestLat === null || selectedDestLon === null) {
@@ -707,6 +831,7 @@
         }
       }
     }
+
 
     function handleGPSError(error) {
       let msg = "";
@@ -858,6 +983,35 @@
         map.setView([lat, lon], 17);
       } else {
         currentMarker.setLatLng([lat, lon]);
+      }
+    }
+
+
+    function updateComparisonMarkers(rawLat, rawLon, filteredLat, filteredLon) {
+      if (map === null) {
+        return;
+      }
+
+      if (rawGpsMarker === null) {
+        rawGpsMarker = L.marker(
+          [rawLat, rawLon],
+          { icon: makeIcon("G", "marker-raw") }
+        ).addTo(map);
+        rawGpsMarker.bindPopup("Raw GPS position");
+      } else {
+        rawGpsMarker.setLatLng([rawLat, rawLon]);
+      }
+
+      if (filteredLat !== null && filteredLon !== null && !isNaN(filteredLat) && !isNaN(filteredLon)) {
+        if (filteredMarker === null) {
+          filteredMarker = L.marker(
+            [filteredLat, filteredLon],
+            { icon: makeIcon("F", "marker-filtered") }
+          ).addTo(map);
+          filteredMarker.bindPopup("EKF filtered position");
+        } else {
+          filteredMarker.setLatLng([filteredLat, filteredLon]);
+        }
       }
     }
 
@@ -1334,18 +1488,290 @@
           if (!data.ok) {
             document.getElementById("commandStatus").innerHTML =
               "Command failed: " + action;
+
+            addTestLogEntry({
+              eventType: "command_failed",
+              command: action,
+              commandSeq: "",
+              rawLat: latestRawLat,
+              rawLon: latestRawLon,
+              rawAcc: latestRawAcc,
+              rawSpeed: "",
+              rawHeading: "",
+              filteredLat: latestLat,
+              filteredLon: latestLon,
+              filteredAcc: latestFilteredAcc,
+              usedLat: latestLat,
+              usedLon: latestLon,
+              usedAcc: latestAcc,
+              rawRouteMetrics: calculateRouteMetricsForPoint(latestRawLat, latestRawLon),
+              filteredRouteMetrics: calculateRouteMetricsForPoint(latestLat, latestLon),
+              usedRouteMetrics: calculateRouteMetricsForPoint(latestLat, latestLon)
+            });
             return;
           }
 
+          lastSentCommandForLog = action;
+          lastCommandSeqForLog = data.seq;
+
           document.getElementById("commandStatus").innerHTML =
             "Command sent: " + action + ", seq=" + data.seq;
+
+          addTestLogEntry({
+            eventType: "command_sent",
+            command: action,
+            commandSeq: data.seq,
+            rawLat: latestRawLat,
+            rawLon: latestRawLon,
+            rawAcc: latestRawAcc,
+            rawSpeed: "",
+            rawHeading: "",
+            filteredLat: latestLat,
+            filteredLon: latestLon,
+            filteredAcc: latestFilteredAcc,
+            usedLat: latestLat,
+            usedLon: latestLon,
+            usedAcc: latestAcc,
+            rawRouteMetrics: calculateRouteMetricsForPoint(latestRawLat, latestRawLon),
+            filteredRouteMetrics: calculateRouteMetricsForPoint(latestLat, latestLon),
+            usedRouteMetrics: calculateRouteMetricsForPoint(latestLat, latestLon)
+          });
         })
         .catch(error => {
           document.getElementById("commandStatus").innerHTML =
             "Failed to send command.";
 
+          addTestLogEntry({
+            eventType: "command_error",
+            command: action,
+            commandSeq: "",
+            rawLat: latestRawLat,
+            rawLon: latestRawLon,
+            rawAcc: latestRawAcc,
+            rawSpeed: "",
+            rawHeading: "",
+            filteredLat: latestLat,
+            filteredLon: latestLon,
+            filteredAcc: latestFilteredAcc,
+            usedLat: latestLat,
+            usedLon: latestLon,
+            usedAcc: latestAcc,
+            rawRouteMetrics: calculateRouteMetricsForPoint(latestRawLat, latestRawLon),
+            filteredRouteMetrics: calculateRouteMetricsForPoint(latestLat, latestLon),
+            usedRouteMetrics: calculateRouteMetricsForPoint(latestLat, latestLon)
+          });
+
           console.error(error);
         });
+    }
+
+    function formatNumber(value, digits) {
+      if (value === null || value === undefined || value === "" || isNaN(Number(value))) {
+        return "";
+      }
+      return Number(value).toFixed(digits);
+    }
+
+    function csvEscape(value) {
+      if (value === null || value === undefined) {
+        return "";
+      }
+
+      const s = String(value);
+      if (s.includes(",") || s.includes("\n") || s.includes('"')) {
+        return '"' + s.replace(/"/g, '""') + '"';
+      }
+      return s;
+    }
+
+    function makeTimestampString() {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, "0");
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+        pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) + "." +
+        String(d.getMilliseconds()).padStart(3, "0");
+    }
+
+    function makeFileTimestamp() {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, "0");
+      return d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + "_" +
+        pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+    }
+
+    function startTestLog() {
+      testLogActive = true;
+      testLogStartTime = performance.now();
+      document.getElementById("logStatus").innerHTML =
+        "Recording... rows: " + testLogRows.length;
+      document.getElementById("status").innerHTML =
+        "Test log started. Ride the route and download CSV after the test.";
+    }
+
+    function stopTestLog() {
+      testLogActive = false;
+      document.getElementById("logStatus").innerHTML =
+        "Stopped. rows: " + testLogRows.length;
+      document.getElementById("status").innerHTML =
+        "Test log stopped. You can download CSV.";
+    }
+
+    function clearTestLog() {
+      testLogRows = [];
+      testLogStartTime = testLogActive ? performance.now() : null;
+      lastSentCommandForLog = "";
+      lastCommandSeqForLog = "";
+      document.getElementById("logStatus").innerHTML =
+        testLogActive ? "Recording... rows: 0" : "Log cleared";
+    }
+
+    function calculateRouteMetricsForPoint(lat, lon) {
+      if (
+        lat === null || lon === null || lat === undefined || lon === undefined ||
+        isNaN(Number(lat)) || isNaN(Number(lon)) || !routeLoaded
+      ) {
+        return {
+          distanceToRoute: "",
+          projectedAlong: "",
+          remainingToNext: ""
+        };
+      }
+
+      const projected = closestPointOnGeometryAlong(Number(lat), Number(lon), null);
+      const distanceToRoute = distanceToRouteGeometryMeters(Number(lat), Number(lon));
+
+      let remainingToNext = "";
+
+      if (
+        projected && routePointCumDistances &&
+        currentRouteIndex < routePointCumDistances.length &&
+        routePointCumDistances[currentRouteIndex] !== undefined &&
+        routePointCumDistances[currentRouteIndex] !== null
+      ) {
+        remainingToNext = routePointCumDistances[currentRouteIndex] - projected.alongDistance;
+      }
+
+      return {
+        distanceToRoute: distanceToRoute,
+        projectedAlong: projected ? projected.alongDistance : "",
+        remainingToNext: remainingToNext
+      };
+    }
+
+    function addTestLogEntry(entry) {
+      if (!testLogActive) {
+        return;
+      }
+
+      const nowPerf = performance.now();
+      const elapsedSec = testLogStartTime === null ? 0 : (nowPerf - testLogStartTime) / 1000.0;
+
+      const rawMetrics = entry.rawRouteMetrics || { distanceToRoute: "", projectedAlong: "", remainingToNext: "" };
+      const filteredMetrics = entry.filteredRouteMetrics || { distanceToRoute: "", projectedAlong: "", remainingToNext: "" };
+      const usedMetrics = entry.usedRouteMetrics || { distanceToRoute: "", projectedAlong: "", remainingToNext: "" };
+
+      const target = routeLoaded && currentRouteIndex < routePoints.length
+        ? routePoints[currentRouteIndex]
+        : null;
+
+      const row = {
+        timestamp: makeTimestampString(),
+        elapsed_sec: elapsedSec,
+        event_type: entry.eventType || "position",
+        position_mode: positionMode,
+        time_slot: selectedTimeSlot,
+        route_loaded: routeLoaded ? 1 : 0,
+        current_route_index: currentRouteIndex,
+        target_node_id: target ? target.node_id : "",
+        target_action: target ? target.action : "",
+        command: entry.command || "",
+        command_seq: entry.commandSeq || "",
+        is_off_route: isOffRoute ? 1 : 0,
+        raw_lat: entry.rawLat,
+        raw_lon: entry.rawLon,
+        raw_accuracy_m: entry.rawAcc,
+        raw_speed_mps: entry.rawSpeed,
+        raw_heading_deg: entry.rawHeading,
+        filtered_lat: entry.filteredLat,
+        filtered_lon: entry.filteredLon,
+        filtered_accuracy_est_m: entry.filteredAcc,
+        used_lat: entry.usedLat,
+        used_lon: entry.usedLon,
+        used_accuracy_m: entry.usedAcc,
+        raw_distance_to_route_m: rawMetrics.distanceToRoute,
+        raw_projected_along_m: rawMetrics.projectedAlong,
+        raw_remaining_to_next_m: rawMetrics.remainingToNext,
+        filtered_distance_to_route_m: filteredMetrics.distanceToRoute,
+        filtered_projected_along_m: filteredMetrics.projectedAlong,
+        filtered_remaining_to_next_m: filteredMetrics.remainingToNext,
+        used_distance_to_route_m: usedMetrics.distanceToRoute,
+        used_projected_along_m: usedMetrics.projectedAlong,
+        used_remaining_to_next_m: usedMetrics.remainingToNext,
+        navigation_along_distance_m: navigationAlongDistance,
+        route_progress_rejected: lastProgressRejected ? 1 : 0,
+        gps_update_accepted: lastGpsUpdateAccepted ? 1 : 0,
+        gps_reject_reason: lastGpsRejectReason,
+        imu_ready: imuReady ? 1 : 0,
+        ekf_speed_mps: ekfX[2],
+        ekf_heading_deg: normalizeAngleRad(ekfX[3]) * 180 / Math.PI,
+        phone_heading_deg: headingDeg
+      };
+
+      testLogRows.push(row);
+
+      document.getElementById("logStatus").innerHTML =
+        (testLogActive ? "Recording" : "Stopped") + "... rows: " + testLogRows.length;
+    }
+
+    function downloadTestLog() {
+      if (testLogRows.length === 0) {
+        document.getElementById("status").innerHTML =
+          "No log rows to download.";
+        return;
+      }
+
+      const headers = [
+        "timestamp", "elapsed_sec", "event_type", "position_mode", "time_slot",
+        "route_loaded", "current_route_index", "target_node_id", "target_action",
+        "command", "command_seq", "is_off_route",
+        "raw_lat", "raw_lon", "raw_accuracy_m", "raw_speed_mps", "raw_heading_deg",
+        "filtered_lat", "filtered_lon", "filtered_accuracy_est_m",
+        "used_lat", "used_lon", "used_accuracy_m",
+        "raw_distance_to_route_m", "raw_projected_along_m", "raw_remaining_to_next_m",
+        "filtered_distance_to_route_m", "filtered_projected_along_m", "filtered_remaining_to_next_m",
+        "used_distance_to_route_m", "used_projected_along_m", "used_remaining_to_next_m",
+        "navigation_along_distance_m", "route_progress_rejected",
+        "gps_update_accepted", "gps_reject_reason", "imu_ready",
+        "ekf_speed_mps", "ekf_heading_deg", "phone_heading_deg"
+      ];
+
+      const lines = [];
+      lines.push(headers.join(","));
+
+      for (const row of testLogRows) {
+        const values = headers.map(h => {
+          const v = row[h];
+          if (typeof v === "number") {
+            return csvEscape(Number.isFinite(v) ? v : "");
+          }
+          return csvEscape(v);
+        });
+        lines.push(values.join(","));
+      }
+
+      const csv = lines.join("\n");
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "shadebike_test_log_" + positionMode + "_" + makeFileTimestamp() + ".csv";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      document.getElementById("status").innerHTML =
+        "CSV downloaded. rows: " + testLogRows.length;
     }
 
     function distanceMeters(lat1, lon1, lat2, lon2) {
