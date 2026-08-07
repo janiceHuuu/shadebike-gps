@@ -295,6 +295,8 @@
     <button class="log-btn" onclick="startTestLog()">Start Test Log</button>
     <button class="log-btn" onclick="stopTestLog()">Stop Test Log</button>
     <button class="log-btn" onclick="downloadTestLog()">Download CSV</button>
+    <button class="log-btn" onclick="downloadRouteTestData()">Download Route Test Data JSON</button>
+    <button class="log-btn" onclick="downloadRTKTemplateCSV()">Download RTK Trigger Template CSV</button>
     <button class="reset-btn" onclick="clearTestLog()">Clear Log</button>
     <div class="hint">
       CSV 會同時記錄 Raw GPS 與 EKF filtered 位置、accuracy、距離路線、沿線進度、到下一導航點剩餘距離、送出的 ESP32 指令。
@@ -1772,6 +1774,170 @@
 
       document.getElementById("status").innerHTML =
         "CSV downloaded. rows: " + testLogRows.length;
+    }
+
+
+    function downloadJsonFile(data, filename) {
+      const jsonText = JSON.stringify(data, null, 2);
+      const blob = new Blob([jsonText], { type: "application/json;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    function getTurnPointsForRouteTestData() {
+      const turnPoints = [];
+
+      if (!routePoints || routePoints.length === 0) {
+        return turnPoints;
+      }
+
+      for (let i = 0; i < routePoints.length; i++) {
+        const p = routePoints[i];
+        const action = String(p.action || "").toUpperCase();
+
+        // RTK 轉彎提示驗證主要看 L/R；A 可用來驗證抵達提示，先一起輸出備用。
+        if (action !== "L" && action !== "R" && action !== "A") {
+          continue;
+        }
+
+        const along = routePointCumDistances && routePointCumDistances[i] !== undefined
+          ? routePointCumDistances[i]
+          : "";
+
+        turnPoints.push({
+          route_index: i,
+          turn_id: String(p.node_id !== undefined && p.node_id !== null ? p.node_id : i),
+          raw_node_id: p.raw_node_id !== undefined && p.raw_node_id !== null ? String(p.raw_node_id) : "",
+          action: action,
+          turn_lat: Number(p.lat),
+          turn_lon: Number(p.lon),
+          turn_along_m: along,
+          trigger_radius_m: TRIGGER_DISTANCE
+        });
+      }
+
+      return turnPoints;
+    }
+
+    function downloadRouteTestData() {
+      if (!routeLoaded || !routeGeometry || routeGeometry.length < 2 || !routePoints || routePoints.length === 0) {
+        document.getElementById("status").innerHTML =
+          "No route loaded. Please request a route first.";
+        return;
+      }
+
+      // 確保 routeGeometryCumDistances 與 routePointCumDistances 已經建立。
+      buildRouteDistanceIndex();
+
+      const routeTestData = {
+        exported_at: makeTimestampString(),
+        time_slot: selectedTimeSlot,
+        trigger_radius_m: TRIGGER_DISTANCE,
+        off_route_distance_m: OFF_ROUTE_DISTANCE,
+        back_on_route_distance_m: BACK_ON_ROUTE_DISTANCE,
+        position_mode_when_exported: positionMode,
+        start: {
+          latest_lat: latestLat,
+          latest_lon: latestLon,
+          latest_raw_lat: latestRawLat,
+          latest_raw_lon: latestRawLon,
+          start_snap: startSnap
+        },
+        destination: {
+          selected_dest_lat: selectedDestLat,
+          selected_dest_lon: selectedDestLon,
+          dest_snap: destSnap
+        },
+        route_geometry: routeGeometry,
+        route_geometry_cum_distances_m: routeGeometryCumDistances,
+        route_points: routePoints.map((p, i) => ({
+          route_index: i,
+          node_id: p.node_id,
+          raw_node_id: p.raw_node_id,
+          lat: Number(p.lat),
+          lon: Number(p.lon),
+          action: p.action,
+          along_m: routePointCumDistances && routePointCumDistances[i] !== undefined
+            ? routePointCumDistances[i]
+            : ""
+        })),
+        turn_points: getTurnPointsForRouteTestData(),
+        edge_info: edgeInfo
+      };
+
+      const filename = "shadebike_route_test_data_" + selectedTimeSlot + "_" + makeFileTimestamp() + ".json";
+      downloadJsonFile(routeTestData, filename);
+
+      document.getElementById("status").innerHTML =
+        "Route test data JSON downloaded. Turn points: " + routeTestData.turn_points.length;
+    }
+
+    function downloadRTKTemplateCSV() {
+      if (!routeLoaded || !routePoints || routePoints.length === 0) {
+        document.getElementById("status").innerHTML =
+          "No route loaded. Please request a route first.";
+        return;
+      }
+
+      const turnPoints = getTurnPointsForRouteTestData();
+
+      if (turnPoints.length === 0) {
+        document.getElementById("status").innerHTML =
+          "No L/R/A turn points found in this route.";
+        return;
+      }
+
+      const headers = [
+        "mode",
+        "test_id",
+        "turn_id",
+        "route_index",
+        "action",
+        "rtk_trigger_lat",
+        "rtk_trigger_lon",
+        "trigger_radius_m",
+        "notes"
+      ];
+
+      const lines = [];
+      lines.push(headers.join(","));
+
+      for (const tp of turnPoints) {
+        for (const mode of ["Raw", "EKF"]) {
+          const row = {
+            mode: mode,
+            test_id: 1,
+            turn_id: tp.turn_id,
+            route_index: tp.route_index,
+            action: tp.action,
+            rtk_trigger_lat: "",
+            rtk_trigger_lon: "",
+            trigger_radius_m: tp.trigger_radius_m,
+            notes: "Fill RTK coordinate measured at actual trigger point"
+          };
+          lines.push(headers.map(h => csvEscape(row[h])).join(","));
+        }
+      }
+
+      const csv = lines.join("\n");
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "shadebike_rtk_trigger_template_" + selectedTimeSlot + "_" + makeFileTimestamp() + ".csv";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      document.getElementById("status").innerHTML =
+        "RTK trigger template CSV downloaded.";
     }
 
     function distanceMeters(lat1, lon1, lat2, lon2) {
